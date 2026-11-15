@@ -14,7 +14,8 @@ export class ApplianceLoggerDO {
         time_str TEXT,
         duration_sec INTEGER,
         duration_str TEXT,
-        timestamp_ms INTEGER
+        timestamp_ms INTEGER,
+        note TEXT DEFAULT ''
       );
       CREATE TABLE IF NOT EXISTS live_state (
         id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -24,9 +25,16 @@ export class ApplianceLoggerDO {
         power_w REAL,
         signal_mv REAL,
         since_ms INTEGER,
-        updated_ms INTEGER
+        updated_ms INTEGER,
+        esp_online INTEGER DEFAULT 1
       );
     `);
+    try {
+      this.sql.exec(`ALTER TABLE logs ADD COLUMN note TEXT DEFAULT ''`);
+    } catch (e) {}
+    try {
+      this.sql.exec(`ALTER TABLE live_state ADD COLUMN esp_online INTEGER DEFAULT 1`);
+    } catch (e) {}
   }
 
   formatIST(ms) {
@@ -76,9 +84,63 @@ export class ApplianceLoggerDO {
     const msg = JSON.stringify(dataObj);
     const sockets = this.ctx.getWebSockets();
     for (const ws of sockets) {
-      try {
-        ws.send(msg);
-      } catch (e) {}
+      try { ws.send(msg); } catch (e) {}
+    }
+  }
+
+  // Automatic 10-Second Watchdog Alarm when ESP32 loses Power or Internet!
+  async alarm() {
+    const rows = this.sql.exec(`SELECT * FROM live_state WHERE id = 1`).toArray();
+    if (!rows.length) return;
+    const prev = rows[0];
+    const now = Date.now();
+
+    if (now - prev.updated_ms >= 9000 && prev.esp_online === 1) {
+      this.sql.exec(`UPDATE live_state SET esp_online = 0 WHERE id = 1`);
+      this.broadcast(this.getFullState());
+    }
+  }
+
+  insertLogRow(appliance, event, current_a, power_w, eventTimeMs, noteStr, knownDurationSec = 0) {
+    const { date_str, day_str, time_str } = this.formatIST(eventTimeMs);
+    let duration_sec = knownDurationSec;
+
+    if (event === "OFF" && duration_sec <= 0) {
+      const lastOn = this.sql.exec(
+        `SELECT timestamp_ms FROM logs WHERE event_type = 'ON' ORDER BY id DESC LIMIT 1`
+      ).toArray();
+      if (lastOn.length > 0) {
+        duration_sec = Math.max(1, Math.round((eventTimeMs - lastOn[0].timestamp_ms) / 1000));
+      }
+    }
+
+    let duration_str = event === "OFF" ? this.formatDuration(duration_sec) : "Running Live...";
+    if (noteStr) {
+      duration_str = `${duration_str} (${noteStr})`;
+    }
+
+    this.sql.exec(
+      `INSERT INTO logs (appliance, event_type, current_a, power_w, date_str, day_str, time_str, duration_sec, duration_str, timestamp_ms, note)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      appliance || "Appliance",
+      event,
+      Number(current_a || 0),
+      Number(power_w || 0),
+      date_str,
+      day_str,
+      time_str,
+      duration_sec,
+      duration_str,
+      eventTimeMs,
+      noteStr || ""
+    );
+
+    if (event === "OFF") {
+      const cleanDur = this.formatDuration(duration_sec);
+      this.sql.exec(
+        `UPDATE logs SET duration_str = 'Ran for ' || ? WHERE id = (SELECT id FROM logs WHERE event_type = 'ON' ORDER BY id DESC LIMIT 1)`,
+        cleanDur
+      );
     }
   }
 
@@ -95,7 +157,7 @@ export class ApplianceLoggerDO {
       return new Response(null, { headers: cors });
     }
 
-    // 1. Real-Time WebSocket Endpoint for Dashboard Clients
+    // 1. Real-Time WebSocket Endpoint
     if (url.pathname === "/api/ws") {
       if (request.headers.get("Upgrade") !== "websocket") {
         return new Response("Expected WebSocket", { status: 426 });
@@ -107,25 +169,87 @@ export class ApplianceLoggerDO {
       return new Response(null, { status: 101, webSocket: client });
     }
 
-    // 2. Ultra-Fast ESP32 Telemetry & Event Endpoint
+    // 2. ESP32 Telemetry, Offline Sync & Power-Recovery Endpoint
     if (url.pathname === "/api/update" && request.method === "POST") {
       const body = await request.json();
       const now = Date.now();
-      const { event, appliance, current_a, power_w, signal_mv } = body;
+      const {
+        event,          // "ON", "OFF", "HEARTBEAT", "BOOT_SYNC"
+        appliance,
+        current_a,
+        power_w,
+        signal_mv,
+        duration_sec,
+        event_epoch_ms, // Sent when flushing offline queued events!
+        is_offline_sync
+      } = body;
+
+      // Schedule watchdog alarm 10 seconds in the future
+      await this.ctx.storage.setAlarm(now + 10000);
+
+      // Use original NTP timestamp if ESP32 is syncing an offline-queued event!
+      const effectiveTimeMs = (event_epoch_ms && event_epoch_ms > 1700000000000) ? Number(event_epoch_ms) : now;
 
       const prevRows = this.sql.exec(`SELECT * FROM live_state WHERE id = 1`).toArray();
       const prev = prevRows.length ? prevRows[0] : null;
 
-      const currentState = (event === "OFF" || Number(current_a) < 0.12) ? "OFF" : "ON";
-      let since_ms = prev ? prev.since_ms : now;
+      const currentState = (event === "OFF" || Number(current_a) < 0.20) ? "OFF" : "ON";
+      let since_ms = prev ? prev.since_ms : effectiveTimeMs;
+      let logsUpdated = false;
 
-      if (event === "ON" || event === "OFF" || (prev && prev.state !== currentState)) {
-        since_ms = now;
+      // --- CASE 2B & 2C: POWER-LOSS / REBOOT RECONCILIATION ---
+      if (event === "ON") {
+        if (prev && prev.state === "ON") {
+          // Sub-Case 2B: Appliance was ALREADY ON before ESP32 rebooted!
+          // Do NOT create a duplicate ON row; keep original since_ms timer running!
+          since_ms = prev.since_ms;
+        } else {
+          since_ms = effectiveTimeMs;
+          logsUpdated = true;
+          const note = is_offline_sync ? "Synced after Net Restore" : "";
+          this.insertLogRow(appliance, "ON", current_a, power_w, effectiveTimeMs, note, 0);
+        }
+      } else if (event === "OFF") {
+        if (!prev || prev.state === "ON" || is_offline_sync) {
+          since_ms = effectiveTimeMs;
+          logsUpdated = true;
+          const note = is_offline_sync ? "Synced after Net Restore" : "";
+          this.insertLogRow(appliance, "OFF", 0.0, 0.0, effectiveTimeMs, note, Number(duration_sec || 0));
+        }
+      } else if (event === " HEARTBEAT" || event === "HEARTBEAT" || event === "BOOT_SYNC") {
+        // Sub-Case 2C: Appliance was ON in DB, ESP32 lost power, appliance turned OFF while ESP32 was dead,
+        // and now ESP32 booted up reporting 0.000A (OFF)!
+        if (prev && prev.state === "ON" && currentState === "OFF") {
+          logsUpdated = true;
+          since_ms = now;
+          this.insertLogRow(
+            prev.appliance || "Appliance",
+            "OFF",
+            0.0,
+            0.0,
+            now,
+            "Auto-Closed after ESP Power/Net Loss",
+            0
+          );
+        } else if ((!prev || prev.state === "OFF") && currentState === "ON") {
+          // Appliance turned ON while ESP32 was dead, and ESP32 just booted seeing current!
+          logsUpdated = true;
+          since_ms = now;
+          this.insertLogRow(
+            appliance || "Appliance",
+            "ON",
+            current_a,
+            power_w,
+            now,
+            "Detected on ESP Recovery",
+            0
+          );
+        }
       }
 
       this.sql.exec(
-        `INSERT INTO live_state (id, state, appliance, current_a, power_w, signal_mv, since_ms, updated_ms)
-         VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO live_state (id, state, appliance, current_a, power_w, signal_mv, since_ms, updated_ms, esp_online)
+         VALUES (1, ?, ?, ?, ?, ?, ?, ?, 1)
          ON CONFLICT(id) DO UPDATE SET
            state=excluded.state,
            appliance=excluded.appliance,
@@ -133,9 +257,10 @@ export class ApplianceLoggerDO {
            power_w=excluded.power_w,
            signal_mv=excluded.signal_mv,
            since_ms=excluded.since_ms,
-           updated_ms=excluded.updated_ms`,
+           updated_ms=excluded.updated_ms,
+           esp_online=1`,
         currentState,
-        appliance || "None",
+        currentState === "OFF" ? "None" : (appliance || "Appliance"),
         Number(current_a || 0),
         Number(power_w || 0),
         Number(signal_mv || 0),
@@ -143,49 +268,6 @@ export class ApplianceLoggerDO {
         now
       );
 
-      let logsUpdated = false;
-      if (event === "ON" || event === "OFF") {
-        logsUpdated = true;
-        const { date_str, day_str, time_str } = this.formatIST(now);
-        let duration_sec = 0;
-
-        if (event === "OFF") {
-          const lastOn = this.sql.exec(
-            `SELECT timestamp_ms FROM logs WHERE event_type = 'ON' ORDER BY id DESC LIMIT 1`
-          ).toArray();
-          if (lastOn.length > 0) {
-            duration_sec = Math.max(1, Math.round((now - lastOn[0].timestamp_ms) / 1000));
-          } else if (body.duration_sec) {
-            duration_sec = Number(body.duration_sec);
-          }
-        }
-
-        const duration_str = event === "OFF" ? this.formatDuration(duration_sec) : "Running Live...";
-
-        this.sql.exec(
-          `INSERT INTO logs (appliance, event_type, current_a, power_w, date_str, day_str, time_str, duration_sec, duration_str, timestamp_ms)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          appliance || "Appliance",
-          event,
-          Number(current_a || 0),
-          Number(power_w || 0),
-          date_str,
-          day_str,
-          time_str,
-          duration_sec,
-          duration_str,
-          now
-        );
-
-        if (event === "OFF") {
-          this.sql.exec(
-            `UPDATE logs SET duration_str = 'Ran for ' || ? WHERE id = (SELECT id FROM logs WHERE event_type = 'ON' ORDER BY id DESC LIMIT 1)`,
-            duration_str
-          );
-        }
-      }
-
-      // Instant WebSocket Broadcast to all connected browsers!
       if (logsUpdated) {
         this.broadcast(this.getFullState());
       } else {
@@ -193,12 +275,13 @@ export class ApplianceLoggerDO {
           type: "LIVE",
           live: {
             state: currentState,
-            appliance: appliance || "None",
+            appliance: currentState === "OFF" ? "None" : (appliance || "None"),
             current_a: Number(current_a || 0),
             power_w: Number(power_w || 0),
             signal_mv: Number(signal_mv || 0),
             since_ms,
-            updated_ms: now
+            updated_ms: now,
+            esp_online: 1
           },
           server_time: now
         });
@@ -207,14 +290,12 @@ export class ApplianceLoggerDO {
       return new Response("OK", { headers: cors });
     }
 
-    // 3. Fallback Status Endpoint
     if (url.pathname === "/api/status" && request.method === "GET") {
       return new Response(JSON.stringify(this.getFullState()), {
         headers: { ...cors, "Content-Type": "application/json" }
       });
     }
 
-    // 4. Clear Logs Endpoint
     if (url.pathname === "/api/clear" && request.method === "DELETE") {
       this.sql.exec(`DELETE FROM logs`);
       this.broadcast(this.getFullState());
@@ -267,6 +348,8 @@ const HTML_UI = `<!DOCTYPE html>
       --success-soft: rgba(16, 185, 129, 0.15);
       --danger: #f43f5e;
       --danger-soft: rgba(244, 63, 94, 0.15);
+      --warn: #f59e0b;
+      --warn-soft: rgba(245, 158, 11, 0.18);
       --text: #f8fafc;
       --text-muted: #94a3b8;
       --radius-lg: 24px;
@@ -283,7 +366,7 @@ const HTML_UI = `<!DOCTYPE html>
     .header {
       display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 16px;
       padding: 18px 24px; background: rgba(19, 27, 46, 0.85); backdrop-filter: blur(16px);
-      border: 1px solid var(--border); border-radius: var(--radius-lg); margin-bottom: 24px;
+      border: 1px solid var(--border); border-radius: var(--radius-lg); margin-bottom: 18px;
     }
     .brand { display: flex; align-items: center; gap: 14px; }
     .brand-icon {
@@ -295,12 +378,19 @@ const HTML_UI = `<!DOCTYPE html>
     .brand p { font-size: 0.82rem; color: var(--text-muted); }
     .conn-pill {
       display: inline-flex; align-items: center; gap: 8px;
-      padding: 8px 16px; border-radius: 999px; font-size: 0.82rem; font-weight: 600;
+      padding: 8px 16px; border-radius: 999px; font-size: 0.82rem; font-weight: 700;
       background: var(--surface-2); border: 1px solid var(--border);
     }
-    .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--text-muted); }
+    .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--danger); }
     .dot.online { background: var(--success); box-shadow: 0 0 12px var(--success); animation: pulse 1.2s infinite; }
     @keyframes pulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.3); opacity: 0.7; } }
+
+    .offline-banner {
+      display: none; align-items: center; gap: 12px;
+      padding: 14px 20px; border-radius: 16px; margin-bottom: 20px;
+      background: var(--warn-soft); border: 1px solid rgba(245, 158, 11, 0.45); color: #fcd34d;
+      font-size: 0.9rem; font-weight: 600;
+    }
 
     .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 18px; margin-bottom: 24px; }
     .card {
@@ -358,14 +448,19 @@ const HTML_UI = `<!DOCTYPE html>
         <div class="brand-icon"><span class="material-symbols-rounded" style="color:white;font-size:28px;">bolt</span></div>
         <div>
           <h1>ESP32 Appliance Telemetry</h1>
-          <p>WebSocket Zero-Latency Live Stream • ACS712-30A</p>
+          <p>Fault-Tolerant Stream • Offline Queue & Power-Loss Recovery</p>
         </div>
       </div>
       <div class="conn-pill">
         <span id="connDot" class="dot"></span>
-        <span id="connText">Connecting WebSocket...</span>
+        <span id="connText">Connecting...</span>
       </div>
     </header>
+
+    <div id="offlineBanner" class="offline-banner">
+      <span class="material-symbols-rounded">warning</span>
+      <span id="offlineText">ESP32 Power or Internet Lost! Waiting for reconnection (Offline events will auto-sync)...</span>
+    </div>
 
     <section class="grid">
       <div id="stateCard" class="card">
@@ -413,7 +508,7 @@ const HTML_UI = `<!DOCTYPE html>
               <th>Sensor Reading</th>
               <th>Date & Day</th>
               <th>Exact Time (IST)</th>
-              <th>ON Duration</th>
+              <th>ON Duration / Status</th>
             </tr>
           </thead>
           <tbody id="logBody">
@@ -450,6 +545,8 @@ const HTML_UI = `<!DOCTYPE html>
       if (!live) return;
       liveData = live;
       const isOn = live.state === 'ON';
+      const espOnline = live.esp_online === 1 && (Date.now() - live.updated_ms < 12000);
+
       document.getElementById('stateCard').className = 'card ' + (isOn ? 'state-on' : '');
       document.getElementById('liveState').textContent = live.state;
       document.getElementById('liveState').style.color = isOn ? '#34d399' : '#f8fafc';
@@ -457,10 +554,22 @@ const HTML_UI = `<!DOCTYPE html>
       document.getElementById('liveCurrent').textContent = Number(live.current_a).toFixed(3) + ' A';
       document.getElementById('liveSignal').textContent = 'ADC Signal: ' + Number(live.signal_mv).toFixed(2) + ' mV';
       document.getElementById('livePower').textContent = Number(live.power_w).toFixed(1) + ' W';
-      document.getElementById('liveSince').textContent = isOn ? 'Streaming Live (1s rate)' : 'Load is OFF';
 
-      document.getElementById('connDot').className = 'dot online';
-      document.getElementById('connText').textContent = 'Real-Time Stream Active';
+      const dot = document.getElementById('connDot');
+      const txt = document.getElementById('connText');
+      const banner = document.getElementById('offlineBanner');
+
+      if (espOnline) {
+        dot.className = 'dot online';
+        txt.textContent = 'ESP32 Online (Real-Time)';
+        banner.style.display = 'none';
+        document.getElementById('liveSince').textContent = isOn ? 'Streaming Live (1s rate)' : 'Load is OFF';
+      } else {
+        dot.className = 'dot';
+        txt.textContent = 'ESP32 Offline / Power Lost';
+        banner.style.display = 'flex';
+        document.getElementById('liveSince').textContent = isOn ? '⚠️ Last known state: ON (ESP Offline)' : 'ESP32 Offline';
+      }
     }
 
     function renderLogs() {
@@ -514,12 +623,6 @@ const HTML_UI = `<!DOCTYPE html>
     function connectWS() {
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
       ws = new WebSocket(\`\${proto}//\${location.host}/api/ws\`);
-
-      ws.onopen = () => {
-        document.getElementById('connDot').className = 'dot online';
-        document.getElementById('connText').textContent = 'WebSocket Live';
-      };
-
       ws.onmessage = (e) => {
         if (e.data === 'PONG') return;
         const data = JSON.parse(e.data);
@@ -531,21 +634,19 @@ const HTML_UI = `<!DOCTYPE html>
           updateLiveUI(data.live);
         }
       };
-
-      ws.onclose = () => {
-        document.getElementById('connDot').className = 'dot';
-        document.getElementById('connText').textContent = 'Reconnecting...';
-        setTimeout(connectWS, 1500);
-      };
+      ws.onclose = () => setTimeout(connectWS, 1500);
     }
 
     setInterval(() => {
       if (ws && ws.readyState === WebSocket.OPEN) ws.send('PING');
-      if (liveData && liveData.state === 'ON') {
-        const elapsed = Math.floor((Date.now() - liveData.since_ms) / 1000);
-        document.getElementById('liveTimer').textContent = formatClock(elapsed);
-      } else {
-        document.getElementById('liveTimer').textContent = '00:00';
+      if (liveData) {
+        updateLiveUI(liveData);
+        if (liveData.state === 'ON') {
+          const elapsed = Math.floor((Date.now() - liveData.since_ms) / 1000);
+          document.getElementById('liveTimer').textContent = formatClock(elapsed);
+        } else {
+          document.getElementById('liveTimer').textContent = '00:00';
+        }
       }
     }, 1000);
 
