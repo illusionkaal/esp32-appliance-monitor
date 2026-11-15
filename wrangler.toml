@@ -1,0 +1,11 @@
+name = "appliance-monitor"
+main = "index.js"
+compatibility_date = "2024-11-01"
+
+[[durable_objects.bindings]]
+name = "LOGGER_DO"
+class_name = "ApplianceLoggerDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ApplianceLoggerDO"]
