@@ -12,10 +12,11 @@ export class ApplianceLoggerDO {
       ac_voltage: "230",
       tariff_rate: "8.5",
       base_sensitivity: "63.00",
-      noise_floor_mv: "6.50",
-      deadzone_amps: "0.24",
-      on_threshold_amps: "0.26",
-      off_threshold_amps: "0.20",
+      noise_floor_mv: "9.50",          // Above 8.47mV idle Wi-Fi noise
+      deadzone_amps: "0.25",           // Sensor deadzone
+      dashboard_deadzone_amps: "0.25", // Strict Dashboard UI cutoff (below this = 0.000A & OFF)
+      on_threshold_amps: "0.27",       // Turn ON only above 0.27A (Fan is ~0.33A)
+      off_threshold_amps: "0.22",      // Turn OFF below 0.22A
       log_unmatched: "1",
       show_state_card: "1",
       show_current_card: "1",
@@ -89,34 +90,19 @@ export class ApplianceLoggerDO {
     try { this.sql.exec(`ALTER TABLE live_state ADD COLUMN raw_current_a REAL DEFAULT 0`); } catch (e) {}
     try { this.sql.exec(`ALTER TABLE live_state ADD COLUMN esp_online INTEGER DEFAULT 1`); } catch (e) {}
 
-    // Remove old noisy small-charger profiles (< 0.25A) automatically if present
-    this.sql.exec(`DELETE FROM appliances WHERE max_a <= 0.25`);
-
-    const count = this.sql.exec(`SELECT COUNT(*) as c FROM appliances`).toArray()[0].c;
-    if (count === 0) {
-      for (const a of this.getGoldenAppliances()) {
-        this.sql.exec(
-          `INSERT INTO appliances (name, icon, min_a, max_a, cal_factor, log_enabled, active) VALUES (?, ?, ?, ?, ?, ?, 1)`,
-          a[0], a[1], a[2], a[3], a[4], a[5]
-        );
-      }
-    }
-
     this.sql.exec(`INSERT OR IGNORE INTO settings (key, val) VALUES ('admin_user', 'admin')`);
     this.sql.exec(`INSERT OR IGNORE INTO settings (key, val) VALUES ('admin_pass', 'vikas@123')`);
 
-    const golden = this.getGoldenSettings();
-    for (const [k, v] of Object.entries(golden)) {
-      this.sql.exec(`INSERT OR IGNORE INTO settings (key, val) VALUES (?, ?)`, k, v);
-    }
-
-    // Auto-heal if old low-deadzone (0.05A) was stuck from previous version
-    const curDead = this.sql.exec(`SELECT val FROM settings WHERE key = 'deadzone_amps'`).toArray();
-    if (curDead.length && Number(curDead[0].val) < 0.15) {
-      this.sql.exec(`UPDATE settings SET val = '6.50' WHERE key = 'noise_floor_mv'`);
-      this.sql.exec(`UPDATE settings SET val = '0.24' WHERE key = 'deadzone_amps'`);
-      this.sql.exec(`UPDATE settings SET val = '0.26' WHERE key = 'on_threshold_amps'`);
-      this.sql.exec(`UPDATE settings SET val = '0.20' WHERE key = 'off_threshold_amps'`);
+    // Force-apply Golden Migration v3 once so stuck Mobile Charger / 0.108A state is wiped immediately!
+    const mig = this.sql.exec(`SELECT val FROM settings WHERE key = 'migration_v3'`).toArray();
+    if (!mig.length) {
+      this.resetToGoldenDefaults(true);
+      this.sql.exec(`INSERT OR REPLACE INTO settings (key, val) VALUES ('migration_v3', 'done')`);
+    } else {
+      const golden = this.getGoldenSettings();
+      for (const [k, v] of Object.entries(golden)) {
+        this.sql.exec(`INSERT OR IGNORE INTO settings (key, val) VALUES (?, ?)`, k, v);
+      }
     }
   }
 
@@ -137,8 +123,11 @@ export class ApplianceLoggerDO {
         );
       }
     }
-    // Also force live_state to OFF if it was stuck on phantom current
-    this.sql.exec(`UPDATE live_state SET state='OFF', appliance='None', current_a=0, raw_current_a=0, power_w=0 WHERE id=1 AND raw_current_a < 0.25`);
+    // Immediately clear any stuck phantom ON state
+    this.sql.exec(
+      `UPDATE live_state SET state='OFF', appliance='None', icon='power_settings_new', current_a=0, raw_current_a=0, power_w=0, since_ms=? WHERE id=1`,
+      Date.now()
+    );
   }
 
   getSettingsObj() {
@@ -166,9 +155,11 @@ export class ApplianceLoggerDO {
   }
 
   matchAppliance(rawAmps, cfg) {
-    const offThresh = Number(cfg.off_threshold_amps || 0.20);
-    const deadzone = Number(cfg.deadzone_amps || 0.24);
-    if (rawAmps < offThresh || rawAmps < deadzone) {
+    const dashDeadzone = Number(cfg.dashboard_deadzone_amps || 0.25);
+    const offThresh = Number(cfg.off_threshold_amps || 0.22);
+    const cutoff = Math.max(dashDeadzone, offThresh);
+
+    if (rawAmps < cutoff) {
       return { name: "None", icon: "power_settings_new", cal_factor: 1.0, log_enabled: 0, matched: false };
     }
     const list = this.sql.exec(`SELECT * FROM appliances WHERE active = 1 ORDER BY min_a ASC`).toArray();
@@ -314,10 +305,14 @@ export class ApplianceLoggerDO {
       const body = await request.json();
       const now = Date.now();
       const cfg = this.getSettingsObj();
+
       const acVolt = Number(cfg.ac_voltage || 230);
-      const deadzone = Number(cfg.deadzone_amps || 0.24);
-      const onThresh = Number(cfg.on_threshold_amps || 0.26);
-      const offThresh = Number(cfg.off_threshold_amps || 0.20);
+      const baseSens = Number(cfg.base_sensitivity || 63.0);
+      const noiseFloorMv = Number(cfg.noise_floor_mv || 9.5);
+      const sensorDeadzone = Number(cfg.deadzone_amps || 0.25);
+      const dashDeadzone = Number(cfg.dashboard_deadzone_amps || 0.25);
+      const onThresh = Math.max(Number(cfg.on_threshold_amps || 0.27), dashDeadzone);
+      const offThresh = Math.max(Number(cfg.off_threshold_amps || 0.22), dashDeadzone * 0.88);
 
       const {
         event,
@@ -331,43 +326,56 @@ export class ApplianceLoggerDO {
       await this.ctx.storage.setAlarm(now + 10000);
       const effectiveTimeMs = (event_epoch_ms && event_epoch_ms > 1700000000000) ? Number(event_epoch_ms) : now;
 
+      const sigMv = Number(signal_mv || 0);
       let rawAmps = Number(current_a || 0);
-      if (rawAmps < deadzone) rawAmps = 0.0;
 
-      const matched = this.matchAppliance(rawAmps, cfg);
-      const calibratedAmps = rawAmps >= offThresh ? (rawAmps * matched.cal_factor) : 0.0;
+      // Server-side recalculation using latest Cloud Noise Floor if signal_mv is present
+      if (sigMv > 0) {
+        if (sigMv <= noiseFloorMv) {
+          rawAmps = 0.0;
+        } else {
+          const trueMv = Math.sqrt((sigMv * sigMv) - (noiseFloorMv * noiseFloorMv));
+          rawAmps = trueMv / baseSens;
+        }
+      }
+
+      // Apply strict Dashboard Display Deadzone!
+      const effectiveCutoff = Math.max(sensorDeadzone, dashDeadzone);
+      let displayAmps = rawAmps < effectiveCutoff ? 0.0 : rawAmps;
+
+      const matched = this.matchAppliance(displayAmps, cfg);
+      const calibratedAmps = displayAmps >= effectiveCutoff ? (displayAmps * matched.cal_factor) : 0.0;
       const calibratedPower = calibratedAmps * acVolt;
 
       const prevRows = this.sql.exec(`SELECT * FROM live_state WHERE id = 1`).toArray();
       const prev = prevRows.length ? prevRows[0] : null;
 
-      const currentState = (event === "OFF" || calibratedAmps < offThresh) ? "OFF" : (calibratedAmps >= onThresh ? "ON" : (prev ? prev.state : "OFF"));
+      const currentState = (event === "OFF" || calibratedAmps < effectiveCutoff)
+        ? "OFF"
+        : (calibratedAmps >= onThresh ? "ON" : (prev ? prev.state : "OFF"));
+
       let since_ms = prev ? prev.since_ms : effectiveTimeMs;
       let logsUpdated = false;
 
-      if (event === "ON" || (currentState === "ON" && (!prev || prev.state === "OFF"))) {
-        if ((!prev || prev.state === "OFF" || is_offline_sync) && calibratedAmps >= onThresh) {
-          since_ms = effectiveTimeMs;
-          if (matched.log_enabled === 1) {
-            logsUpdated = true;
-            const note = is_offline_sync ? "Synced after Net Restore" : "";
-            this.insertLogRow(matched.name, matched.icon, "ON", calibratedAmps, calibratedPower, effectiveTimeMs, note, 0);
-          }
+      if (currentState === "ON" && (!prev || prev.state === "OFF")) {
+        since_ms = effectiveTimeMs;
+        if (matched.log_enabled === 1) {
+          logsUpdated = true;
+          const note = is_offline_sync ? "Synced after Net Restore" : "";
+          this.insertLogRow(matched.name, matched.icon, "ON", calibratedAmps, calibratedPower, effectiveTimeMs, note, 0);
         }
-      } else if (event === "OFF" || (currentState === "OFF" && prev && prev.state === "ON")) {
-        if (!prev || prev.state === "ON" || is_offline_sync) {
-          since_ms = effectiveTimeMs;
-          const prevApp = is_offline_sync && matched.name !== "None" ? matched.name : (prev ? prev.appliance : "Appliance");
-          const prevIcon = prev ? prev.icon : matched.icon;
-          const prevMatch = this.sql.exec(`SELECT log_enabled FROM appliances WHERE name = ?`, prevApp).toArray();
-          const shouldLogOff = prevMatch.length ? Number(prevMatch[0].log_enabled) === 1 : true;
+      } else if (currentState === "OFF" && prev && prev.state === "ON") {
+        since_ms = effectiveTimeMs;
+        const prevApp = prev.appliance || "Appliance";
+        const prevIcon = prev.icon || "bolt";
+        const prevMatch = this.sql.exec(`SELECT log_enabled FROM appliances WHERE name = ?`, prevApp).toArray();
+        const shouldLogOff = prevMatch.length ? Number(prevMatch[0].log_enabled) === 1 : false;
 
-          if (shouldLogOff && prevApp !== "None") {
-            logsUpdated = true;
-            let note = is_offline_sync ? "Synced after Net Restore" : "";
-            if (event === "BOOT_SYNC") note = "Auto-Closed after ESP Power Loss";
-            this.insertLogRow(prevApp, prevIcon, "OFF", 0.0, 0.0, effectiveTimeMs, note, Number(duration_sec || 0));
-          }
+        if (shouldLogOff && prevApp !== "None") {
+          logsUpdated = true;
+          let note = is_offline_sync ? "Synced after Net Restore" : "";
+          if (event === "BOOT_SYNC") note = "Auto-Closed after ESP Power Loss";
+          this.insertLogRow(prevApp, prevIcon, "OFF", 0.0, 0.0, effectiveTimeMs, note, Number(duration_sec || 0));
         }
       } else if (currentState === "ON" && prev && prev.state === "ON" && matched.name !== prev.appliance && matched.name !== "None") {
         if (matched.log_enabled === 1) {
@@ -378,6 +386,8 @@ export class ApplianceLoggerDO {
 
       const finalAppName = currentState === "OFF" ? "None" : matched.name;
       const finalIcon = currentState === "OFF" ? "power_settings_new" : matched.icon;
+      const finalCurrent = currentState === "OFF" ? 0.0 : calibratedAmps;
+      const finalPower = currentState === "OFF" ? 0.0 : calibratedPower;
 
       this.sql.exec(
         `INSERT INTO live_state (id, state, appliance, icon, current_a, raw_current_a, power_w, signal_mv, since_ms, updated_ms, esp_online)
@@ -396,10 +406,10 @@ export class ApplianceLoggerDO {
         currentState,
         finalAppName,
         finalIcon,
-        calibratedAmps,
+        finalCurrent,
         rawAmps,
-        calibratedPower,
-        Number(signal_mv || 0),
+        finalPower,
+        sigMv,
         since_ms,
         now
       );
@@ -413,10 +423,10 @@ export class ApplianceLoggerDO {
             state: currentState,
             appliance: finalAppName,
             icon: finalIcon,
-            current_a: calibratedAmps,
+            current_a: finalCurrent,
             raw_current_a: rawAmps,
-            power_w: calibratedPower,
-            signal_mv: Number(signal_mv || 0),
+            power_w: finalPower,
+            signal_mv: sigMv,
             since_ms,
             updated_ms: now,
             esp_online: 1
@@ -429,9 +439,9 @@ export class ApplianceLoggerDO {
         JSON.stringify({
           ok: true,
           cfg: {
-            sens: Number(cfg.base_sensitivity || 63.0),
-            noise: Number(cfg.noise_floor_mv || 6.5),
-            deadzone: deadzone,
+            sens: baseSens,
+            noise: noiseFloorMv,
+            deadzone: effectiveCutoff,
             on_a: onThresh,
             off_a: offThresh
           }
@@ -468,7 +478,6 @@ export class ApplianceLoggerDO {
         });
       }
 
-      // One-Click Golden Calibration Reset Endpoint!
       if (url.pathname === "/api/admin/reset-defaults" && request.method === "POST") {
         const body = await request.json();
         this.resetToGoldenDefaults(body.reset_appliances !== false);
@@ -518,6 +527,12 @@ export class ApplianceLoggerDO {
             k, String(v)
           );
         }
+        // Immediately enforce new dashboard deadzone on live_state if currently below threshold
+        const dashDead = Number(body.dashboard_deadzone_amps || 0.25);
+        this.sql.exec(
+          `UPDATE live_state SET state='OFF', appliance='None', icon='power_settings_new', current_a=0, power_w=0 WHERE id=1 AND raw_current_a < ?`,
+          dashDead
+        );
         const st = this.getFullState();
         this.broadcast(st);
         return new Response(JSON.stringify({ ok: true, state: st }), {
@@ -833,26 +848,25 @@ const HTML_UI = `<!DOCTYPE html>
 
     <!-- PROTECTED ADMIN STUDIO VIEW -->
     <div id="adminSection">
-      <!-- ONE-CLICK GOLDEN RESET BANNER -->
       <button class="btn-golden" onclick="resetToGoldenDefaults()">
         <span class="material-symbols-rounded">restart_alt</span>
-        <span>Reset to Tested Working Calibration (63.00 mV/A • 6.50mV Noise Floor • 0.24A Deadzone • Fan & Iron Defaults)</span>
+        <span>Reset to Tested Working Calibration (63.00 mV/A • 9.5mV Noise Floor • 0.25A Dashboard Deadzone • Fan & Iron Defaults)</span>
       </button>
 
       <div class="admin-grid">
         <!-- Left Column: Appliance Manager -->
         <div class="card">
           <div class="panel-title">
-            <span>🔌 Dynamic Appliance Profiles (≥ 0.25A Recommended)</span>
+            <span>🔌 Dynamic Appliance Profiles (≥ 0.25A)</span>
             <button class="icon-btn" onclick="resetApplianceForm()">+ New Profile</button>
           </div>
 
           <div style="padding:12px 14px;border-radius:12px;background:var(--primary-soft);border:1px solid rgba(99,102,241,0.3);margin-bottom:14px;font-size:0.84rem;">
-            📡 <strong>Live Sensor Reading:</strong>
+            📡 <strong>Raw Sensor Preview (Before Deadzone):</strong>
             <span id="adminLiveRaw" class="mono" style="color:#34d399;font-size:1rem;">0.000 A</span>
             (<span id="adminLiveMv" class="mono">0.00 mV</span>)
             <div style="color:var(--text-muted);font-size:0.76rem;margin-top:3px;">
-              Note: Small loads below 0.24A (like phone chargers) are automatically filtered out to prevent Wi-Fi ripple false triggers.
+              Anything below the <strong>Dashboard Display Deadzone (0.25A)</strong> is forced to <strong>0.000 A & OFF</strong> on the public dashboard.
             </div>
           </div>
 
@@ -872,7 +886,7 @@ const HTML_UI = `<!DOCTYPE html>
                   <option value="ac_unit">Cooler / AC (ac_unit)</option>
                   <option value="water_heater">Geyser / Heater (water_heater)</option>
                   <option value="tv">TV / Monitor (tv)</option>
-                  <option value="laptop_mac">Laptop / PC (laptop_mac)</option>
+                  <option value="laptop_mac">PC / Desktop (laptop_mac)</option>
                   <option value="bolt">General Load (bolt)</option>
                 </select>
               </div>
@@ -908,19 +922,23 @@ const HTML_UI = `<!DOCTYPE html>
         <!-- Right Column: Sensor Calibration + Dashboard UI Controls -->
         <div style="display:flex;flex-direction:column;gap:18px;">
           <div class="card">
-            <div class="panel-title"><span>🎛️ Global Sensor Calibration (Auto-Syncs to ESP32)</span></div>
+            <div class="panel-title"><span>🎛️ Dashboard Deadzone & Sensor Calibration</span></div>
             <form onsubmit="saveGlobalSettings(event)">
               <div class="form-grid">
+                <div class="field" style="grid-column: 1 / -1; background: rgba(16, 185, 129, 0.12); padding: 10px 12px; border-radius: 12px; border: 1px solid rgba(16, 185, 129, 0.35);">
+                  <label style="color:#34d399;">🛡️ Dashboard Display Deadzone (Amps) — Cutoff below this = 0.000A & OFF</label>
+                  <input type="number" step="0.01" id="cfgDashDeadzone" required>
+                </div>
                 <div class="field">
                   <label>ACS712 Base Sensitivity (mV/A)</label>
                   <input type="number" step="0.01" id="cfgSens" required>
                 </div>
                 <div class="field">
                   <label>Zero-Load Noise Floor (mV)</label>
-                  <input type="number" step="0.05" id="cfgNoise" required>
+                  <input type="number" step="0.1" id="cfgNoise" required>
                 </div>
                 <div class="field">
-                  <label>Zero Deadzone (Amps)</label>
+                  <label>ESP32 Hardware Deadzone (Amps)</label>
                   <input type="number" step="0.01" id="cfgDeadzone" required>
                 </div>
                 <div class="field">
@@ -1077,20 +1095,31 @@ const HTML_UI = `<!DOCTYPE html>
     function updateLiveUI(live) {
       if (!live) return;
       liveData = live;
-      const isOn = live.state === 'ON';
+
+      // Client-side enforcement of Dashboard Display Deadzone as a second layer of protection!
+      const dashDeadzone = Number(settings.dashboard_deadzone_amps || 0.25);
+      const rawCurr = Number(live.current_a || 0);
+      const isTrulyOn = (live.state === 'ON') && (rawCurr >= dashDeadzone);
+
+      const shownCurr = isTrulyOn ? rawCurr : 0.0;
+      const shownPower = isTrulyOn ? Number(live.power_w || 0) : 0.0;
+      const shownState = isTrulyOn ? 'ON' : 'OFF';
+      const shownApp = isTrulyOn ? (live.appliance || 'Appliance') : 'None';
+      const shownIcon = isTrulyOn ? (live.icon || 'bolt') : 'power_settings_new';
+
       const espOnline = live.esp_online === 1 && (Date.now() - live.updated_ms < 12000);
 
-      document.getElementById('cardStateWrap').className = 'card ' + (isOn ? 'state-on' : '');
-      document.getElementById('liveState').textContent = live.state;
-      document.getElementById('liveState').style.color = isOn ? '#34d399' : '#f8fafc';
-      document.getElementById('liveIcon').textContent = live.icon || 'power_settings_new';
-      document.getElementById('liveAppliance').textContent = 'Detected: ' + (live.appliance || 'None');
-      document.getElementById('liveCurrent').textContent = Number(live.current_a).toFixed(3) + ' A';
-      document.getElementById('liveSignal').textContent = 'ADC Signal: ' + Number(live.signal_mv).toFixed(2) + ' mV';
-      document.getElementById('livePower').textContent = Number(live.power_w).toFixed(1) + ' W';
+      document.getElementById('cardStateWrap').className = 'card ' + (isTrulyOn ? 'state-on' : '');
+      document.getElementById('liveState').textContent = shownState;
+      document.getElementById('liveState').style.color = isTrulyOn ? '#34d399' : '#f8fafc';
+      document.getElementById('liveIcon').textContent = shownIcon;
+      document.getElementById('liveAppliance').textContent = 'Detected: ' + shownApp;
+      document.getElementById('liveCurrent').textContent = shownCurr.toFixed(3) + ' A';
+      document.getElementById('liveSignal').textContent = 'ADC Signal: ' + Number(live.signal_mv).toFixed(2) + ' mV (Cutoff: ' + dashDeadzone.toFixed(2) + 'A)';
+      document.getElementById('livePower').textContent = shownPower.toFixed(1) + ' W';
 
       const rate = Number(settings.tariff_rate || 8.5);
-      const costPerHr = (Number(live.power_w) / 1000) * rate;
+      const costPerHr = (shownPower / 1000) * rate;
       document.getElementById('liveCost').textContent = \`Est. Cost: ₹\${costPerHr.toFixed(2)} / hr (@ ₹\${rate}/kWh)\`;
 
       const rawEl = document.getElementById('adminLiveRaw');
@@ -1107,12 +1136,16 @@ const HTML_UI = `<!DOCTYPE html>
         dot.className = 'dot online';
         txt.textContent = 'ESP32 Live';
         banner.style.display = 'none';
-        document.getElementById('liveSince').textContent = isOn ? 'Streaming Live (1s rate)' : 'Load is OFF';
+        document.getElementById('liveSince').textContent = isTrulyOn ? 'Streaming Live (1s rate)' : 'Idle (Below ' + dashDeadzone.toFixed(2) + 'A Deadzone)';
       } else {
         dot.className = 'dot';
         txt.textContent = 'ESP32 Offline';
         banner.style.display = 'flex';
-        document.getElementById('liveSince').textContent = isOn ? '⚠️ Last state: ON (ESP Offline)' : 'ESP32 Offline';
+        document.getElementById('liveSince').textContent = isTrulyOn ? '⚠️ Last state: ON (ESP Offline)' : 'ESP32 Offline';
+      }
+
+      if (!isTrulyOn) {
+        document.getElementById('liveTimer').textContent = '00:00';
       }
     }
 
@@ -1238,11 +1271,12 @@ const HTML_UI = `<!DOCTYPE html>
         </div>
       \`).join('');
 
+      document.getElementById('cfgDashDeadzone').value = settings.dashboard_deadzone_amps || '0.25';
       document.getElementById('cfgSens').value = settings.base_sensitivity || '63.00';
-      document.getElementById('cfgNoise').value = settings.noise_floor_mv || '6.50';
-      document.getElementById('cfgDeadzone').value = settings.deadzone_amps || '0.24';
-      document.getElementById('cfgOnA').value = settings.on_threshold_amps || '0.26';
-      document.getElementById('cfgOffA').value = settings.off_threshold_amps || '0.20';
+      document.getElementById('cfgNoise').value = settings.noise_floor_mv || '9.50';
+      document.getElementById('cfgDeadzone').value = settings.deadzone_amps || '0.25';
+      document.getElementById('cfgOnA').value = settings.on_threshold_amps || '0.27';
+      document.getElementById('cfgOffA').value = settings.off_threshold_amps || '0.22';
       document.getElementById('cfgVolt').value = settings.ac_voltage || '230';
       document.getElementById('cfgTariff').value = settings.tariff_rate || '8.5';
       document.getElementById('cfgUnmatched').value = settings.log_unmatched ?? '1';
@@ -1261,7 +1295,7 @@ const HTML_UI = `<!DOCTYPE html>
     }
 
     async function resetToGoldenDefaults() {
-      if (!confirm('Restore Tested Working Calibration (63.00 mV/A, 6.50mV Noise, 0.24A Deadzone) and default Fan/Fridge/Iron profiles?')) return;
+      if (!confirm('Restore Tested Working Calibration (0.25A Dashboard Deadzone, 9.5mV Noise Floor) and default Fan/Fridge/Iron profiles?')) return;
       const res = await fetch('/api/admin/reset-defaults', {
         method: 'POST',
         headers: {
@@ -1277,6 +1311,7 @@ const HTML_UI = `<!DOCTYPE html>
         settings = data.state.settings;
         populateAdminForms();
         applySettingsUI();
+        updateLiveUI(data.state.live);
         showToast('✅ Restored to Tested Working Calibration!');
       }
     }
@@ -1343,6 +1378,7 @@ const HTML_UI = `<!DOCTYPE html>
       const newPass = document.getElementById('cfgAdminPass').value;
       const newUser = document.getElementById('cfgAdminUser').value.trim();
       const payload = {
+        dashboard_deadzone_amps: document.getElementById('cfgDashDeadzone').value,
         base_sensitivity: document.getElementById('cfgSens').value,
         noise_floor_mv: document.getElementById('cfgNoise').value,
         deadzone_amps: document.getElementById('cfgDeadzone').value,
@@ -1382,7 +1418,7 @@ const HTML_UI = `<!DOCTYPE html>
           sessionStorage.setItem('adm_p', newPass);
           document.getElementById('cfgAdminPass').value = '';
         }
-        showToast('Settings saved & synced to ESP32!');
+        showToast('Settings saved & enforced on Dashboard!');
       }
     }
 
@@ -1413,7 +1449,9 @@ const HTML_UI = `<!DOCTYPE html>
     setInterval(() => {
       if (liveData) {
         updateLiveUI(liveData);
-        if (liveData.state === 'ON') {
+        const dashDeadzone = Number(settings.dashboard_deadzone_amps || 0.25);
+        const isTrulyOn = (liveData.state === 'ON') && (Number(liveData.current_a || 0) >= dashDeadzone);
+        if (isTrulyOn) {
           const elapsed = Math.floor((Date.now() - liveData.since_ms) / 1000);
           document.getElementById('liveTimer').textContent = formatClock(elapsed);
         } else {
