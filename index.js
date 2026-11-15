@@ -52,7 +52,7 @@ export class ApplianceLoggerDO {
   }
 
   formatDuration(sec) {
-    if (!sec || sec <= 0) return "-";
+    if (!sec || sec <= 0) return "< 1s";
     const hrs = Math.floor(sec / 3600);
     const mins = Math.floor((sec % 3600) / 60);
     const secs = Math.floor(sec % 60);
@@ -61,44 +61,67 @@ export class ApplianceLoggerDO {
     return `${secs}s`;
   }
 
+  getFullState() {
+    const liveRows = this.sql.exec(`SELECT * FROM live_state WHERE id = 1`).toArray();
+    const logs = this.sql.exec(`SELECT * FROM logs ORDER BY id DESC LIMIT 150`).toArray();
+    return {
+      type: "SYNC",
+      live: liveRows.length ? liveRows[0] : null,
+      logs,
+      server_time: Date.now()
+    };
+  }
+
+  broadcast(dataObj) {
+    const msg = JSON.stringify(dataObj);
+    const sockets = this.ctx.getWebSockets();
+    for (const ws of sockets) {
+      try {
+        ws.send(msg);
+      } catch (e) {}
+    }
+  }
+
   async fetch(request) {
     const url = new URL(request.url);
     const cors = {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type"
+      "Access-Control-Allow-Headers": "Content-Type",
+      "Connection": "keep-alive"
     };
 
     if (request.method === "OPTIONS") {
       return new Response(null, { headers: cors });
     }
 
-    // 1. ESP32 Event & Telemetry Endpoint
+    // 1. Real-Time WebSocket Endpoint for Dashboard Clients
+    if (url.pathname === "/api/ws") {
+      if (request.headers.get("Upgrade") !== "websocket") {
+        return new Response("Expected WebSocket", { status: 426 });
+      }
+      const pair = new WebSocketPair();
+      const [client, server] = Object.values(pair);
+      this.ctx.acceptWebSocket(server);
+      server.send(JSON.stringify(this.getFullState()));
+      return new Response(null, { status: 101, webSocket: client });
+    }
+
+    // 2. Ultra-Fast ESP32 Telemetry & Event Endpoint
     if (url.pathname === "/api/update" && request.method === "POST") {
       const body = await request.json();
       const now = Date.now();
-      const {
-        event,         // "ON", "OFF", or "HEARTBEAT"
-        appliance,     // "Iron", "Fan", "Iron + Fan", "None"
-        current_a,
-        power_w,
-        signal_mv,
-        on_current_a   // Peak/Avg current during the ON session (sent on OFF)
-      } = body;
+      const { event, appliance, current_a, power_w, signal_mv } = body;
 
       const prevRows = this.sql.exec(`SELECT * FROM live_state WHERE id = 1`).toArray();
       const prev = prevRows.length ? prevRows[0] : null;
 
+      const currentState = (event === "OFF" || Number(current_a) < 0.12) ? "OFF" : "ON";
       let since_ms = prev ? prev.since_ms : now;
-      if (event === "ON") {
-        since_ms = now;
-      } else if (event === "OFF") {
-        since_ms = now;
-      } else if (prev && prev.state !== (current_a >= 0.12 ? "ON" : "OFF")) {
+
+      if (event === "ON" || event === "OFF" || (prev && prev.state !== currentState)) {
         since_ms = now;
       }
-
-      const currentState = (event === "OFF" || current_a < 0.12) ? "OFF" : "ON";
 
       this.sql.exec(
         `INSERT INTO live_state (id, state, appliance, current_a, power_w, signal_mv, since_ms, updated_ms)
@@ -120,14 +143,15 @@ export class ApplianceLoggerDO {
         now
       );
 
-      // Log state change (ON or OFF)
+      let logsUpdated = false;
       if (event === "ON" || event === "OFF") {
+        logsUpdated = true;
         const { date_str, day_str, time_str } = this.formatIST(now);
         let duration_sec = 0;
 
         if (event === "OFF") {
           const lastOn = this.sql.exec(
-            `SELECT timestamp_ms, current_a FROM logs WHERE event_type = 'ON' ORDER BY id DESC LIMIT 1`
+            `SELECT timestamp_ms FROM logs WHERE event_type = 'ON' ORDER BY id DESC LIMIT 1`
           ).toArray();
           if (lastOn.length > 0) {
             duration_sec = Math.max(1, Math.round((now - lastOn[0].timestamp_ms) / 1000));
@@ -136,15 +160,14 @@ export class ApplianceLoggerDO {
           }
         }
 
-        const duration_str = event === "OFF" ? this.formatDuration(duration_sec) : "Running...";
-        const loggedCurrent = Number(current_a || 0);
+        const duration_str = event === "OFF" ? this.formatDuration(duration_sec) : "Running Live...";
 
         this.sql.exec(
           `INSERT INTO logs (appliance, event_type, current_a, power_w, date_str, day_str, time_str, duration_sec, duration_str, timestamp_ms)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           appliance || "Appliance",
           event,
-          loggedCurrent,
+          Number(current_a || 0),
           Number(power_w || 0),
           date_str,
           day_str,
@@ -154,37 +177,47 @@ export class ApplianceLoggerDO {
           now
         );
 
-        // If OFF, also update the matching previous ON row's duration_str so both rows show clarity
         if (event === "OFF") {
           this.sql.exec(
-            `UPDATE logs SET duration_str = 'Completed (' || ? || ')' WHERE id = (SELECT id FROM logs WHERE event_type = 'ON' ORDER BY id DESC LIMIT 1)`,
+            `UPDATE logs SET duration_str = 'Ran for ' || ? WHERE id = (SELECT id FROM logs WHERE event_type = 'ON' ORDER BY id DESC LIMIT 1)`,
             duration_str
           );
         }
       }
 
-      return new Response(JSON.stringify({ ok: true, timestamp: now }), {
+      // Instant WebSocket Broadcast to all connected browsers!
+      if (logsUpdated) {
+        this.broadcast(this.getFullState());
+      } else {
+        this.broadcast({
+          type: "LIVE",
+          live: {
+            state: currentState,
+            appliance: appliance || "None",
+            current_a: Number(current_a || 0),
+            power_w: Number(power_w || 0),
+            signal_mv: Number(signal_mv || 0),
+            since_ms,
+            updated_ms: now
+          },
+          server_time: now
+        });
+      }
+
+      return new Response("OK", { headers: cors });
+    }
+
+    // 3. Fallback Status Endpoint
+    if (url.pathname === "/api/status" && request.method === "GET") {
+      return new Response(JSON.stringify(this.getFullState()), {
         headers: { ...cors, "Content-Type": "application/json" }
       });
     }
 
-    // 2. Dashboard Data Fetch Endpoint
-    if (url.pathname === "/api/status" && request.method === "GET") {
-      const liveRows = this.sql.exec(`SELECT * FROM live_state WHERE id = 1`).toArray();
-      const logs = this.sql.exec(`SELECT * FROM logs ORDER BY id DESC LIMIT 150`).toArray();
-      return new Response(
-        JSON.stringify({
-          live: liveRows.length ? liveRows[0] : null,
-          logs,
-          server_time: Date.now()
-        }),
-        { headers: { ...cors, "Content-Type": "application/json" } }
-      );
-    }
-
-    // 3. Clear Logs Endpoint
+    // 4. Clear Logs Endpoint
     if (url.pathname === "/api/clear" && request.method === "DELETE") {
       this.sql.exec(`DELETE FROM logs`);
+      this.broadcast(this.getFullState());
       return new Response(JSON.stringify({ ok: true }), {
         headers: { ...cors, "Content-Type": "application/json" }
       });
@@ -192,6 +225,11 @@ export class ApplianceLoggerDO {
 
     return new Response("Not Found", { status: 404 });
   }
+
+  async webSocketMessage(ws, message) {
+    if (message === "PING") ws.send("PONG");
+  }
+  async webSocketClose(ws) { ws.close(); }
 }
 
 export default {
@@ -214,7 +252,7 @@ const HTML_UI = `<!DOCTYPE html>
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Smart Appliance Telemetry • Material 3</title>
+  <title>Real-Time Appliance Telemetry • Material 3</title>
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
   <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@24,500,1,0" rel="stylesheet" />
   <style>
@@ -229,14 +267,10 @@ const HTML_UI = `<!DOCTYPE html>
       --success-soft: rgba(16, 185, 129, 0.15);
       --danger: #f43f5e;
       --danger-soft: rgba(244, 63, 94, 0.15);
-      --warning: #f59e0b;
-      --warning-soft: rgba(245, 158, 11, 0.15);
       --text: #f8fafc;
       --text-muted: #94a3b8;
       --radius-lg: 24px;
-      --radius-md: 16px;
     }
-
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
       font-family: 'Plus Jakarta Sans', sans-serif;
@@ -245,373 +279,117 @@ const HTML_UI = `<!DOCTYPE html>
       min-height: 100vh;
       padding: 20px;
     }
-
-    .container {
-      max-width: 1200px;
-      margin: 0 auto;
-    }
-
-    /* Top App Bar */
+    .container { max-width: 1200px; margin: 0 auto; }
     .header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      flex-wrap: wrap;
-      gap: 16px;
-      padding: 18px 24px;
-      background: rgba(19, 27, 46, 0.8);
-      backdrop-filter: blur(16px);
-      border: 1px solid var(--border);
-      border-radius: var(--radius-lg);
-      margin-bottom: 24px;
+      display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 16px;
+      padding: 18px 24px; background: rgba(19, 27, 46, 0.85); backdrop-filter: blur(16px);
+      border: 1px solid var(--border); border-radius: var(--radius-lg); margin-bottom: 24px;
     }
-
-    .brand {
-      display: flex;
-      align-items: center;
-      gap: 14px;
-    }
-
+    .brand { display: flex; align-items: center; gap: 14px; }
     .brand-icon {
-      width: 48px;
-      height: 48px;
-      border-radius: 16px;
+      width: 48px; height: 48px; border-radius: 16px;
       background: linear-gradient(135deg, #6366f1, #8b5cf6);
-      display: grid;
-      place-items: center;
-      box-shadow: 0 8px 20px rgba(99, 102, 241, 0.35);
+      display: grid; place-items: center; box-shadow: 0 8px 20px rgba(99, 102, 241, 0.35);
     }
-
-    .brand h1 {
-      font-size: 1.25rem;
-      font-weight: 800;
-      letter-spacing: -0.02em;
-    }
-
-    .brand p {
-      font-size: 0.82rem;
-      color: var(--text-muted);
-    }
-
+    .brand h1 { font-size: 1.25rem; font-weight: 800; }
+    .brand p { font-size: 0.82rem; color: var(--text-muted); }
     .conn-pill {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      padding: 8px 16px;
-      border-radius: 999px;
-      font-size: 0.82rem;
-      font-weight: 600;
-      background: var(--surface-2);
-      border: 1px solid var(--border);
+      display: inline-flex; align-items: center; gap: 8px;
+      padding: 8px 16px; border-radius: 999px; font-size: 0.82rem; font-weight: 600;
+      background: var(--surface-2); border: 1px solid var(--border);
     }
+    .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--text-muted); }
+    .dot.online { background: var(--success); box-shadow: 0 0 12px var(--success); animation: pulse 1.2s infinite; }
+    @keyframes pulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.3); opacity: 0.7; } }
 
-    .dot {
-      width: 10px;
-      height: 10px;
-      border-radius: 50%;
-      background: var(--text-muted);
-    }
-    .dot.online {
-      background: var(--success);
-      box-shadow: 0 0 12px var(--success);
-      animation: pulse 2s infinite;
-    }
-
-    @keyframes pulse {
-      0%, 100% { transform: scale(1); opacity: 1; }
-      50% { transform: scale(1.25); opacity: 0.7; }
-    }
-
-    /* Live Hero Grid */
-    .grid {
-      display: grid;
-      grid-template-columns: repeat(4, 1fr);
-      gap: 18px;
-      margin-bottom: 24px;
-    }
-
+    .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 18px; margin-bottom: 24px; }
     .card {
-      background: rgba(19, 27, 46, 0.85);
-      border: 1px solid var(--border);
-      border-radius: var(--radius-lg);
-      padding: 22px;
-      position: relative;
-      overflow: hidden;
-      transition: transform 0.2s ease, border-color 0.2s ease;
+      background: rgba(19, 27, 46, 0.85); border: 1px solid var(--border);
+      border-radius: var(--radius-lg); padding: 22px; transition: all 0.15s ease;
     }
-
-    .card:hover {
-      transform: translateY(-2px);
-      border-color: rgba(99, 102, 241, 0.35);
-    }
-
-    .card-head {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      color: var(--text-muted);
-      font-size: 0.85rem;
-      font-weight: 600;
-      margin-bottom: 12px;
-    }
-
-    .card-value {
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 2rem;
-      font-weight: 700;
-      margin-bottom: 6px;
-    }
-
-    .card-sub {
-      font-size: 0.8rem;
-      color: var(--text-muted);
-    }
-
+    .card-head { display: flex; justify-content: space-between; align-items: center; color: var(--text-muted); font-size: 0.82rem; font-weight: 700; margin-bottom: 12px; }
+    .card-value { font-family: 'JetBrains Mono', monospace; font-size: 2rem; font-weight: 700; margin-bottom: 6px; }
+    .card-sub { font-size: 0.8rem; color: var(--text-muted); }
     .state-on {
-      background: linear-gradient(135deg, rgba(16, 185, 129, 0.18), rgba(19, 27, 46, 0.9));
-      border-color: rgba(16, 185, 129, 0.4);
+      background: linear-gradient(135deg, rgba(16, 185, 129, 0.22), rgba(19, 27, 46, 0.92));
+      border-color: rgba(16, 185, 129, 0.5);
+      box-shadow: 0 0 25px rgba(16, 185, 129, 0.15);
     }
-    .state-off {
-      background: rgba(19, 27, 46, 0.85);
-    }
-
-    /* Filter & Action Bar */
-    .toolbar {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      flex-wrap: wrap;
-      gap: 12px;
-      margin-bottom: 16px;
-    }
-
-    .chips {
-      display: flex;
-      gap: 8px;
-      flex-wrap: wrap;
-    }
-
+    .toolbar { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; margin-bottom: 16px; }
+    .chips { display: flex; gap: 8px; flex-wrap: wrap; }
     .chip {
-      padding: 8px 16px;
-      border-radius: 999px;
-      font-size: 0.85rem;
-      font-weight: 600;
-      cursor: pointer;
-      border: 1px solid var(--border);
-      background: var(--surface);
-      color: var(--text-muted);
-      transition: all 0.2s;
+      padding: 8px 16px; border-radius: 999px; font-size: 0.85rem; font-weight: 600;
+      cursor: pointer; border: 1px solid var(--border); background: var(--surface); color: var(--text-muted);
     }
-
-    .chip.active {
-      background: var(--primary);
-      color: white;
-      border-color: var(--primary);
-      box-shadow: 0 4px 14px rgba(99, 102, 241, 0.35);
-    }
-
+    .chip.active { background: var(--primary); color: white; border-color: var(--primary); }
     .btn-danger {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      padding: 8px 16px;
-      border-radius: 12px;
-      border: 1px solid rgba(244, 63, 94, 0.3);
-      background: var(--danger-soft);
-      color: #fda4af;
-      font-size: 0.84rem;
-      font-weight: 600;
-      cursor: pointer;
+      display: inline-flex; align-items: center; gap: 6px; padding: 8px 16px; border-radius: 12px;
+      border: 1px solid rgba(244, 63, 94, 0.3); background: var(--danger-soft); color: #fda4af; font-size: 0.84rem; font-weight: 600; cursor: pointer;
     }
+    .table-card { background: rgba(19, 27, 46, 0.85); border: 1px solid var(--border); border-radius: var(--radius-lg); overflow: hidden; }
+    .table-wrap { width: 100%; overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; text-align: left; }
+    th { padding: 16px 20px; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-muted); background: rgba(28, 39, 66, 0.5); border-bottom: 1px solid var(--border); }
+    td { padding: 16px 20px; font-size: 0.92rem; border-bottom: 1px solid var(--border); }
+    .badge { display: inline-flex; align-items: center; gap: 6px; padding: 5px 12px; border-radius: 999px; font-size: 0.78rem; font-weight: 700; }
+    .badge-on { background: var(--success-soft); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.3); }
+    .badge-off { background: var(--danger-soft); color: #fb7185; border: 1px solid rgba(244, 63, 94, 0.3); }
+    .app-tag { display: inline-flex; align-items: center; gap: 6px; font-weight: 700; }
+    .mono { font-family: 'JetBrains Mono', monospace; font-weight: 600; }
+    .duration-pill { display: inline-flex; align-items: center; gap: 5px; padding: 4px 10px; border-radius: 8px; background: var(--primary-soft); color: #a5b4fc; font-family: 'JetBrains Mono', monospace; font-size: 0.82rem; font-weight: 600; }
+    .empty-state { padding: 48px 20px; text-align: center; color: var(--text-muted); }
 
-    /* Log Table & Mobile Cards */
-    .table-card {
-      background: rgba(19, 27, 46, 0.85);
-      border: 1px solid var(--border);
-      border-radius: var(--radius-lg);
-      overflow: hidden;
-    }
-
-    .table-wrap {
-      width: 100%;
-      overflow-x: auto;
-    }
-
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      text-align: left;
-    }
-
-    th {
-      padding: 16px 20px;
-      font-size: 0.78rem;
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-      color: var(--text-muted);
-      background: rgba(28, 39, 66, 0.5);
-      border-bottom: 1px solid var(--border);
-    }
-
-    td {
-      padding: 16px 20px;
-      font-size: 0.92rem;
-      border-bottom: 1px solid var(--border);
-      vertical-align: middle;
-    }
-
-    tr:last-child td { border-bottom: none; }
-    tr:hover td { background: rgba(255, 255, 255, 0.02); }
-
-    .badge {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      padding: 5px 12px;
-      border-radius: 999px;
-      font-size: 0.78rem;
-      font-weight: 700;
-      letter-spacing: 0.03em;
-    }
-
-    .badge-on {
-      background: var(--success-soft);
-      color: #34d399;
-      border: 1px solid rgba(16, 185, 129, 0.3);
-    }
-
-    .badge-off {
-      background: var(--danger-soft);
-      color: #fb7185;
-      border: 1px solid rgba(244, 63, 94, 0.3);
-    }
-
-    .app-tag {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      font-weight: 700;
-    }
-
-    .mono {
-      font-family: 'JetBrains Mono', monospace;
-      font-weight: 600;
-    }
-
-    .duration-pill {
-      display: inline-flex;
-      align-items: center;
-      gap: 5px;
-      padding: 4px 10px;
-      border-radius: 8px;
-      background: var(--primary-soft);
-      color: #a5b4fc;
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 0.82rem;
-      font-weight: 600;
-    }
-
-    .empty-state {
-      padding: 48px 20px;
-      text-align: center;
-      color: var(--text-muted);
-    }
-
-    /* Responsive Breakpoints */
-    @media (max-width: 992px) {
-      .grid { grid-template-columns: repeat(2, 1fr); }
-    }
-
+    @media (max-width: 992px) { .grid { grid-template-columns: repeat(2, 1fr); } }
     @media (max-width: 640px) {
       body { padding: 12px; }
       .grid { grid-template-columns: 1fr; gap: 12px; }
-      .card { padding: 18px; }
-      .card-value { font-size: 1.65rem; }
-      
-      /* Turn table rows into sleek Material cards on Mobile */
       thead { display: none; }
       table, tbody, tr, td { display: block; width: 100%; }
-      tr {
-        padding: 16px;
-        border-bottom: 1px solid var(--border);
-      }
-      td {
-        padding: 6px 0;
-        border: none;
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        font-size: 0.88rem;
-      }
-      td::before {
-        content: attr(data-label);
-        color: var(--text-muted);
-        font-size: 0.78rem;
-        font-weight: 600;
-        text-transform: uppercase;
-      }
+      tr { padding: 16px; border-bottom: 1px solid var(--border); }
+      td { padding: 6px 0; border: none; display: flex; justify-content: space-between; align-items: center; }
+      td::before { content: attr(data-label); color: var(--text-muted); font-size: 0.78rem; font-weight: 600; text-transform: uppercase; }
     }
   </style>
 </head>
 <body>
   <div class="container">
-    <!-- Top Bar -->
     <header class="header">
       <div class="brand">
-        <div class="brand-icon">
-          <span class="material-symbols-rounded" style="color:white;font-size:28px;">bolt</span>
-        </div>
+        <div class="brand-icon"><span class="material-symbols-rounded" style="color:white;font-size:28px;">bolt</span></div>
         <div>
           <h1>ESP32 Appliance Telemetry</h1>
-          <p>ACS712-30A True-RMS Live Logger & Session Tracker</p>
+          <p>WebSocket Zero-Latency Live Stream • ACS712-30A</p>
         </div>
       </div>
       <div class="conn-pill">
         <span id="connDot" class="dot"></span>
-        <span id="connText">Waiting for ESP32...</span>
+        <span id="connText">Connecting WebSocket...</span>
       </div>
     </header>
 
-    <!-- Live Telemetry Cards -->
     <section class="grid">
-      <div id="stateCard" class="card state-off">
-        <div class="card-head">
-          <span>CURRENT STATE</span>
-          <span class="material-symbols-rounded">power_settings_new</span>
-        </div>
+      <div id="stateCard" class="card">
+        <div class="card-head"><span>CURRENT STATE</span><span class="material-symbols-rounded">power_settings_new</span></div>
         <div id="liveState" class="card-value">OFF</div>
         <div id="liveAppliance" class="card-sub">Appliance: None</div>
       </div>
-
       <div class="card">
-        <div class="card-head">
-          <span>LIVE CURRENT (RMS)</span>
-          <span class="material-symbols-rounded">electric_meter</span>
-        </div>
+        <div class="card-head"><span>LIVE CURRENT (RMS)</span><span class="material-symbols-rounded">electric_meter</span></div>
         <div id="liveCurrent" class="card-value">0.000 A</div>
         <div id="liveSignal" class="card-sub">ADC Signal: 0.00 mV</div>
       </div>
-
       <div class="card">
-        <div class="card-head">
-          <span>ACTIVE POWER</span>
-          <span class="material-symbols-rounded">speed</span>
-        </div>
+        <div class="card-head"><span>ACTIVE POWER</span><span class="material-symbols-rounded">speed</span></div>
         <div id="livePower" class="card-value">0.0 W</div>
         <div class="card-sub">At 230V AC Nominal</div>
       </div>
-
       <div class="card">
-        <div class="card-head">
-          <span>ACTIVE TIMER</span>
-          <span class="material-symbols-rounded">timer</span>
-        </div>
+        <div class="card-head"><span>ACTIVE SESSION TIMER</span><span class="material-symbols-rounded">timer</span></div>
         <div id="liveTimer" class="card-value">00:00</div>
         <div id="liveSince" class="card-sub">Idle</div>
       </div>
     </section>
 
-    <!-- Filter & Actions -->
     <div class="toolbar">
       <div class="chips">
         <button class="chip active" onclick="setFilter('ALL', this)">All Events</button>
@@ -621,12 +399,10 @@ const HTML_UI = `<!DOCTYPE html>
         <button class="chip" onclick="setFilter('OFF', this)">OFF Logs</button>
       </div>
       <button class="btn-danger" onclick="clearLogs()">
-        <span class="material-symbols-rounded" style="font-size:18px;">delete</span>
-        Clear History
+        <span class="material-symbols-rounded" style="font-size:18px;">delete</span> Clear History
       </button>
     </div>
 
-    <!-- Logs Table -->
     <div class="table-card">
       <div class="table-wrap">
         <table>
@@ -641,7 +417,7 @@ const HTML_UI = `<!DOCTYPE html>
             </tr>
           </thead>
           <tbody id="logBody">
-            <tr><td colspan="6" class="empty-state">Loading telemetry logs...</td></tr>
+            <tr><td colspan="6" class="empty-state">Waiting for real-time telemetry...</td></tr>
           </tbody>
         </table>
       </div>
@@ -652,6 +428,7 @@ const HTML_UI = `<!DOCTYPE html>
     let allLogs = [];
     let currentFilter = 'ALL';
     let liveData = null;
+    let ws = null;
 
     function formatClock(sec) {
       if (sec < 0) sec = 0;
@@ -669,6 +446,23 @@ const HTML_UI = `<!DOCTYPE html>
       renderLogs();
     }
 
+    function updateLiveUI(live) {
+      if (!live) return;
+      liveData = live;
+      const isOn = live.state === 'ON';
+      document.getElementById('stateCard').className = 'card ' + (isOn ? 'state-on' : '');
+      document.getElementById('liveState').textContent = live.state;
+      document.getElementById('liveState').style.color = isOn ? '#34d399' : '#f8fafc';
+      document.getElementById('liveAppliance').textContent = 'Detected: ' + (live.appliance || 'None');
+      document.getElementById('liveCurrent').textContent = Number(live.current_a).toFixed(3) + ' A';
+      document.getElementById('liveSignal').textContent = 'ADC Signal: ' + Number(live.signal_mv).toFixed(2) + ' mV';
+      document.getElementById('livePower').textContent = Number(live.power_w).toFixed(1) + ' W';
+      document.getElementById('liveSince').textContent = isOn ? 'Streaming Live (1s rate)' : 'Load is OFF';
+
+      document.getElementById('connDot').className = 'dot online';
+      document.getElementById('connText').textContent = 'Real-Time Stream Active';
+    }
+
     function renderLogs() {
       const tbody = document.getElementById('logBody');
       const filtered = allLogs.filter(item => {
@@ -678,7 +472,7 @@ const HTML_UI = `<!DOCTYPE html>
       });
 
       if (!filtered.length) {
-        tbody.innerHTML = '<tr><td colspan="6" class="empty-state">No ON/OFF events recorded yet. Turn ON your Iron or Fan!</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="6" class="empty-state">No ON/OFF events recorded yet.</td></tr>';
         return;
       }
 
@@ -700,7 +494,7 @@ const HTML_UI = `<!DOCTYPE html>
               </span>
             </td>
             <td data-label="Sensor Reading" class="mono">
-              \${Number(row.current_a).toFixed(3)} A <span style="color:var(--text-muted);font-size:0.8rem;">(\${ Number(row.power_w).toFixed(0) } W)</span>
+              \${Number(row.current_a).toFixed(3)} A <span style="color:var(--text-muted);font-size:0.8rem;">(\${Number(row.power_w).toFixed(0)} W)</span>
             </td>
             <td data-label="Date & Day">
               <strong>\${row.date_str}</strong> <span style="color:var(--text-muted);">• \${row.day_str}</span>
@@ -717,45 +511,36 @@ const HTML_UI = `<!DOCTYPE html>
       }).join('');
     }
 
-    async function fetchStatus() {
-      try {
-        const res = await fetch('/api/status');
-        const data = await res.json();
-        allLogs = data.logs || [];
-        liveData = data.live;
+    function connectWS() {
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      ws = new WebSocket(\`\${proto}//\${location.host}/api/ws\`);
 
-        if (liveData) {
-          const ageSec = (data.server_time - liveData.updated_ms) / 1000;
-          const dot = document.getElementById('connDot');
-          const txt = document.getElementById('connText');
-          if (ageSec < 15) {
-            dot.className = 'dot online';
-            txt.textContent = 'ESP32 Live (' + Math.max(0, Math.round(ageSec)) + 's ago)';
-          } else {
-            dot.className = 'dot';
-            txt.textContent = 'ESP32 Offline (' + Math.round(ageSec) + 's ago)';
-          }
+      ws.onopen = () => {
+        document.getElementById('connDot').className = 'dot online';
+        document.getElementById('connText').textContent = 'WebSocket Live';
+      };
 
-          const isOn = liveData.state === 'ON';
-          const stateCard = document.getElementById('stateCard');
-          stateCard.className = 'card ' + (isOn ? 'state-on' : 'state-off');
-
-          document.getElementById('liveState').textContent = liveData.state;
-          document.getElementById('liveState').style.color = isOn ? '#34d399' : '#f8fafc';
-          document.getElementById('liveAppliance').textContent = 'Detected: ' + (liveData.appliance || 'None');
-          document.getElementById('liveCurrent').textContent = Number(liveData.current_a).toFixed(3) + ' A';
-          document.getElementById('liveSignal').textContent = 'ADC Signal: ' + Number(liveData.signal_mv).toFixed(2) + ' mV';
-          document.getElementById('livePower').textContent = Number(liveData.power_w).toFixed(1) + ' W';
-          document.getElementById('liveSince').textContent = isOn ? 'Running continuously' : 'Load is OFF';
+      ws.onmessage = (e) => {
+        if (e.data === 'PONG') return;
+        const data = JSON.parse(e.data);
+        if (data.type === 'SYNC') {
+          allLogs = data.logs || [];
+          updateLiveUI(data.live);
+          renderLogs();
+        } else if (data.type === 'LIVE') {
+          updateLiveUI(data.live);
         }
+      };
 
-        renderLogs();
-      } catch (e) {
-        console.error(e);
-      }
+      ws.onclose = () => {
+        document.getElementById('connDot').className = 'dot';
+        document.getElementById('connText').textContent = 'Reconnecting...';
+        setTimeout(connectWS, 1500);
+      };
     }
 
     setInterval(() => {
+      if (ws && ws.readyState === WebSocket.OPEN) ws.send('PING');
       if (liveData && liveData.state === 'ON') {
         const elapsed = Math.floor((Date.now() - liveData.since_ms) / 1000);
         document.getElementById('liveTimer').textContent = formatClock(elapsed);
@@ -767,11 +552,9 @@ const HTML_UI = `<!DOCTYPE html>
     async function clearLogs() {
       if (!confirm('Clear all appliance history logs?')) return;
       await fetch('/api/clear', { method: 'DELETE' });
-      fetchStatus();
     }
 
-    fetchStatus();
-    setInterval(fetchStatus, 2000);
+    connectWS();
   </script>
 </body>
 </html>`;
