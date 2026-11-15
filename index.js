@@ -5,6 +5,38 @@ export class ApplianceLoggerDO {
     this.initTables();
   }
 
+  getGoldenSettings() {
+    return {
+      dashboard_title: "ESP32 Smart Appliance Telemetry",
+      dashboard_subtitle: "Dynamic Cloud-Calibrated True-RMS Power & Session Logger",
+      ac_voltage: "230",
+      tariff_rate: "8.5",
+      base_sensitivity: "63.00",
+      noise_floor_mv: "6.50",
+      deadzone_amps: "0.24",
+      on_threshold_amps: "0.26",
+      off_threshold_amps: "0.20",
+      log_unmatched: "1",
+      show_state_card: "1",
+      show_current_card: "1",
+      show_power_card: "1",
+      show_timer_card: "1",
+      show_signal_mv: "1",
+      show_cost_est: "1",
+      show_filters: "1",
+      allow_public_clear: "0"
+    };
+  }
+
+  getGoldenAppliances() {
+    return [
+      ["Ceiling / Table Fan", "mode_fan", 0.26, 0.55, 1.00, 1],
+      ["Fridge / Air Cooler", "kitchen", 0.55, 1.80, 1.00, 1],
+      ["Electric Iron (Press)", "iron", 1.80, 4.15, 1.00, 1],
+      ["Iron + Fan (Combined)", "bolt", 4.15, 15.00, 1.00, 1]
+    ];
+  }
+
   initTables() {
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS logs (
@@ -57,18 +89,12 @@ export class ApplianceLoggerDO {
     try { this.sql.exec(`ALTER TABLE live_state ADD COLUMN raw_current_a REAL DEFAULT 0`); } catch (e) {}
     try { this.sql.exec(`ALTER TABLE live_state ADD COLUMN esp_online INTEGER DEFAULT 1`); } catch (e) {}
 
-    // Seed Default Appliances if empty
+    // Remove old noisy small-charger profiles (< 0.25A) automatically if present
+    this.sql.exec(`DELETE FROM appliances WHERE max_a <= 0.25`);
+
     const count = this.sql.exec(`SELECT COUNT(*) as c FROM appliances`).toArray()[0].c;
     if (count === 0) {
-      const defaults = [
-        ["Mobile / Small Charger", "smartphone", 0.05, 0.18, 1.00, 1],
-        ["Laptop Charger", "laptop_mac", 0.18, 0.28, 1.00, 1],
-        ["Ceiling / Table Fan", "mode_fan", 0.28, 0.55, 1.00, 1],
-        ["Fridge / Air Cooler", "kitchen", 0.55, 1.80, 1.00, 1],
-        ["Electric Iron (Press)", "iron", 1.80, 4.15, 1.00, 1],
-        ["Iron + Fan (Combined)", "bolt", 4.15, 15.00, 1.00, 1]
-      ];
-      for (const a of defaults) {
+      for (const a of this.getGoldenAppliances()) {
         this.sql.exec(
           `INSERT INTO appliances (name, icon, min_a, max_a, cal_factor, log_enabled, active) VALUES (?, ?, ?, ?, ?, ?, 1)`,
           a[0], a[1], a[2], a[3], a[4], a[5]
@@ -76,33 +102,43 @@ export class ApplianceLoggerDO {
       }
     }
 
-    // Seed Default Settings if empty
-    const defaultCfg = {
-      admin_user: "admin",
-      admin_pass: "vikas@123",
-      dashboard_title: "ESP32 Smart Appliance Telemetry",
-      dashboard_subtitle: "Dynamic Cloud-Calibrated True-RMS Power & Session Logger",
-      ac_voltage: "230",
-      tariff_rate: "8.5",
-      base_sensitivity: "63.00",
-      noise_floor_mv: "5.20",
-      deadzone_amps: "0.05",
-      on_threshold_amps: "0.06",
-      off_threshold_amps: "0.04",
-       log_unmatched: "1",
-      show_state_card: "1",
-      show_current_card: "1",
-      show_power_card: "1",
-      show_timer_card: "1",
-      show_signal_mv: "1",
-      show_cost_est: "1",
-      show_filters: "1",
-      allow_public_clear: "0"
-    };
+    this.sql.exec(`INSERT OR IGNORE INTO settings (key, val) VALUES ('admin_user', 'admin')`);
+    this.sql.exec(`INSERT OR IGNORE INTO settings (key, val) VALUES ('admin_pass', 'vikas@123')`);
 
-    for (const [k, v] of Object.entries(defaultCfg)) {
+    const golden = this.getGoldenSettings();
+    for (const [k, v] of Object.entries(golden)) {
       this.sql.exec(`INSERT OR IGNORE INTO settings (key, val) VALUES (?, ?)`, k, v);
     }
+
+    // Auto-heal if old low-deadzone (0.05A) was stuck from previous version
+    const curDead = this.sql.exec(`SELECT val FROM settings WHERE key = 'deadzone_amps'`).toArray();
+    if (curDead.length && Number(curDead[0].val) < 0.15) {
+      this.sql.exec(`UPDATE settings SET val = '6.50' WHERE key = 'noise_floor_mv'`);
+      this.sql.exec(`UPDATE settings SET val = '0.24' WHERE key = 'deadzone_amps'`);
+      this.sql.exec(`UPDATE settings SET val = '0.26' WHERE key = 'on_threshold_amps'`);
+      this.sql.exec(`UPDATE settings SET val = '0.20' WHERE key = 'off_threshold_amps'`);
+    }
+  }
+
+  resetToGoldenDefaults(resetAppliancesToo = true) {
+    const golden = this.getGoldenSettings();
+    for (const [k, v] of Object.entries(golden)) {
+      this.sql.exec(
+        `INSERT INTO settings (key, val) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET val = excluded.val`,
+        k, String(v)
+      );
+    }
+    if (resetAppliancesToo) {
+      this.sql.exec(`DELETE FROM appliances`);
+      for (const a of this.getGoldenAppliances()) {
+        this.sql.exec(
+          `INSERT INTO appliances (name, icon, min_a, max_a, cal_factor, log_enabled, active) VALUES (?, ?, ?, ?, ?, ?, 1)`,
+          a[0], a[1], a[2], a[3], a[4], a[5]
+        );
+      }
+    }
+    // Also force live_state to OFF if it was stuck on phantom current
+    this.sql.exec(`UPDATE live_state SET state='OFF', appliance='None', current_a=0, raw_current_a=0, power_w=0 WHERE id=1 AND raw_current_a < 0.25`);
   }
 
   getSettingsObj() {
@@ -130,8 +166,9 @@ export class ApplianceLoggerDO {
   }
 
   matchAppliance(rawAmps, cfg) {
-    const offThresh = Number(cfg.off_threshold_amps || 0.04);
-    if (rawAmps < offThresh) {
+    const offThresh = Number(cfg.off_threshold_amps || 0.20);
+    const deadzone = Number(cfg.deadzone_amps || 0.24);
+    if (rawAmps < offThresh || rawAmps < deadzone) {
       return { name: "None", icon: "power_settings_new", cal_factor: 1.0, log_enabled: 0, matched: false };
     }
     const list = this.sql.exec(`SELECT * FROM appliances WHERE active = 1 ORDER BY min_a ASC`).toArray();
@@ -147,7 +184,7 @@ export class ApplianceLoggerDO {
       }
     }
     return {
-      name: `Unknown Load (${rawAmps.toFixed(2)}A)`,
+      name: `Other Load (${rawAmps.toFixed(2)}A)`,
       icon: "electrical_services",
       cal_factor: 1.0,
       log_enabled: Number(cfg.log_unmatched ?? 1),
@@ -262,7 +299,6 @@ export class ApplianceLoggerDO {
 
     if (request.method === "OPTIONS") return new Response(null, { headers: cors });
 
-    // 1. WebSocket Stream
     if (url.pathname === "/api/ws") {
       if (request.headers.get("Upgrade") !== "websocket") {
         return new Response("Expected WebSocket", { status: 426 });
@@ -274,14 +310,14 @@ export class ApplianceLoggerDO {
       return new Response(null, { status: 101, webSocket: client });
     }
 
-    // 2. ESP32 Telemetry & Dynamic Config Sync Endpoint
     if (url.pathname === "/api/update" && request.method === "POST") {
       const body = await request.json();
       const now = Date.now();
       const cfg = this.getSettingsObj();
       const acVolt = Number(cfg.ac_voltage || 230);
-      const onThresh = Number(cfg.on_threshold_amps || 0.06);
-      const offThresh = Number(cfg.off_threshold_amps || 0.04);
+      const deadzone = Number(cfg.deadzone_amps || 0.24);
+      const onThresh = Number(cfg.on_threshold_amps || 0.26);
+      const offThresh = Number(cfg.off_threshold_amps || 0.20);
 
       const {
         event,
@@ -295,7 +331,9 @@ export class ApplianceLoggerDO {
       await this.ctx.storage.setAlarm(now + 10000);
       const effectiveTimeMs = (event_epoch_ms && event_epoch_ms > 1700000000000) ? Number(event_epoch_ms) : now;
 
-      const rawAmps = Number(current_a || 0);
+      let rawAmps = Number(current_a || 0);
+      if (rawAmps < deadzone) rawAmps = 0.0;
+
       const matched = this.matchAppliance(rawAmps, cfg);
       const calibratedAmps = rawAmps >= offThresh ? (rawAmps * matched.cal_factor) : 0.0;
       const calibratedPower = calibratedAmps * acVolt;
@@ -308,7 +346,7 @@ export class ApplianceLoggerDO {
       let logsUpdated = false;
 
       if (event === "ON" || (currentState === "ON" && (!prev || prev.state === "OFF"))) {
-        if (!prev || prev.state === "OFF" || is_offline_sync) {
+        if ((!prev || prev.state === "OFF" || is_offline_sync) && calibratedAmps >= onThresh) {
           since_ms = effectiveTimeMs;
           if (matched.log_enabled === 1) {
             logsUpdated = true;
@@ -321,11 +359,10 @@ export class ApplianceLoggerDO {
           since_ms = effectiveTimeMs;
           const prevApp = is_offline_sync && matched.name !== "None" ? matched.name : (prev ? prev.appliance : "Appliance");
           const prevIcon = prev ? prev.icon : matched.icon;
-          // Check if previous appliance had logging enabled
           const prevMatch = this.sql.exec(`SELECT log_enabled FROM appliances WHERE name = ?`, prevApp).toArray();
           const shouldLogOff = prevMatch.length ? Number(prevMatch[0].log_enabled) === 1 : true;
 
-          if (shouldLogOff) {
+          if (shouldLogOff && prevApp !== "None") {
             logsUpdated = true;
             let note = is_offline_sync ? "Synced after Net Restore" : "";
             if (event === "BOOT_SYNC") note = "Auto-Closed after ESP Power Loss";
@@ -333,7 +370,6 @@ export class ApplianceLoggerDO {
           }
         }
       } else if (currentState === "ON" && prev && prev.state === "ON" && matched.name !== prev.appliance && matched.name !== "None") {
-        // Appliance switched mid-session (e.g. Fan was ON, then Iron also turned ON, or switched load)
         if (matched.log_enabled === 1) {
           logsUpdated = true;
           this.insertLogRow(matched.name, matched.icon, "ON", calibratedAmps, calibratedPower, now, `Switched from ${prev.appliance}`, 0);
@@ -389,14 +425,13 @@ export class ApplianceLoggerDO {
         });
       }
 
-      // Return latest calibration parameters to ESP32 so ESP32 auto-tunes itself!
       return new Response(
         JSON.stringify({
           ok: true,
           cfg: {
             sens: Number(cfg.base_sensitivity || 63.0),
-            noise: Number(cfg.noise_floor_mv || 5.2),
-            deadzone: Number(cfg.deadzone_amps || 0.05),
+            noise: Number(cfg.noise_floor_mv || 6.5),
+            deadzone: deadzone,
             on_a: onThresh,
             off_a: offThresh
           }
@@ -405,14 +440,12 @@ export class ApplianceLoggerDO {
       );
     }
 
-    // 3. Status Endpoint
     if (url.pathname === "/api/status" && request.method === "GET") {
       return new Response(JSON.stringify(this.getFullState()), {
         headers: { ...cors, "Content-Type": "application/json" }
       });
     }
 
-    // 4. Admin Login Verification
     if (url.pathname === "/api/admin/login" && request.method === "POST") {
       const { username, password } = await request.json();
       const s = this.getSettingsObj();
@@ -427,11 +460,21 @@ export class ApplianceLoggerDO {
       });
     }
 
-    // 5. Admin Protected Routes (Appliance CRUD + Settings + Calibration)
     if (url.pathname.startsWith("/api/admin/")) {
       if (!this.checkAuth(request)) {
         return new Response(JSON.stringify({ error: "Unauthorized" }), {
           status: 401,
+          headers: { ...cors, "Content-Type": "application/json" }
+        });
+      }
+
+      // One-Click Golden Calibration Reset Endpoint!
+      if (url.pathname === "/api/admin/reset-defaults" && request.method === "POST") {
+        const body = await request.json();
+        this.resetToGoldenDefaults(body.reset_appliances !== false);
+        const st = this.getFullState();
+        this.broadcast(st);
+        return new Response(JSON.stringify({ ok: true, state: st }), {
           headers: { ...cors, "Content-Type": "application/json" }
         });
       }
@@ -483,7 +526,6 @@ export class ApplianceLoggerDO {
       }
     }
 
-    // 6. Clear History Logs
     if (url.pathname === "/api/clear" && request.method === "DELETE") {
       const s = this.getSettingsObj();
       if (s.allow_public_clear !== "1" && !this.checkAuth(request)) {
@@ -558,7 +600,6 @@ const HTML_UI = `<!DOCTYPE html>
     }
     .container { max-width: 1240px; margin: 0 auto; }
 
-    /* Top Header */
     .header {
       display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 14px;
       padding: 16px 22px; background: rgba(19, 27, 46, 0.88); backdrop-filter: blur(16px);
@@ -598,7 +639,6 @@ const HTML_UI = `<!DOCTYPE html>
       font-size: 0.88rem; font-weight: 600;
     }
 
-    /* Live Cards Grid */
     .grid {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
@@ -617,7 +657,6 @@ const HTML_UI = `<!DOCTYPE html>
       border-color: rgba(16, 185, 129, 0.5);
     }
 
-    /* Toolbar & Filters */
     .toolbar { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; margin-bottom: 16px; }
     .chips { display: flex; gap: 8px; flex-wrap: wrap; }
     .chip {
@@ -630,7 +669,6 @@ const HTML_UI = `<!DOCTYPE html>
       border: 1px solid rgba(244, 63, 94, 0.3); background: var(--danger-soft); color: #fda4af; font-size: 0.82rem; font-weight: 600; cursor: pointer;
     }
 
-    /* Table */
     .table-card { background: rgba(19, 27, 46, 0.88); border: 1px solid var(--border); border-radius: var(--radius-lg); overflow: hidden; }
     .table-wrap { width: 100%; overflow-x: auto; }
     table { width: 100%; border-collapse: collapse; text-align: left; }
@@ -644,10 +682,9 @@ const HTML_UI = `<!DOCTYPE html>
     .duration-pill { display: inline-flex; align-items: center; gap: 5px; padding: 4px 10px; border-radius: 8px; background: var(--primary-soft); color: #a5b4fc; font-family: 'JetBrains Mono', monospace; font-size: 0.8rem; font-weight: 600; }
     .empty-state { padding: 42px 20px; text-align: center; color: var(--text-muted); }
 
-    /* ADMIN STUDIO PANEL */
     #adminSection { display: none; margin-top: 10px; }
     .admin-grid { display: grid; grid-template-columns: 1.35fr 1fr; gap: 18px; margin-bottom: 24px; }
-    .panel-title { font-size: 1.05rem; font-weight: 800; margin-bottom: 14px; display: flex; justify-content: space-between; align-items: center; }
+    .panel-title { font-size: 1.05rem; font-weight: 800; margin-bottom: 14px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
     .form-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }
     .field { display: flex; flex-direction: column; gap: 5px; }
     .field label { font-size: 0.75rem; color: var(--text-muted); font-weight: 700; text-transform: uppercase; }
@@ -660,6 +697,16 @@ const HTML_UI = `<!DOCTYPE html>
       display: inline-flex; align-items: center; justify-content: center; gap: 6px;
       padding: 11px 18px; border-radius: 12px; border: none; cursor: pointer;
       background: linear-gradient(135deg, #6366f1, #8b5cf6); color: white; font-weight: 700; font-size: 0.88rem;
+    }
+    .btn-golden {
+      display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+      padding: 12px 18px; border-radius: 12px; cursor: pointer; width: 100%;
+      background: linear-gradient(135deg, rgba(245, 158, 11, 0.25), rgba(16, 185, 129, 0.25));
+      border: 1px solid rgba(245, 158, 11, 0.5); color: #fde68a; font-weight: 800; font-size: 0.88rem;
+      margin-bottom: 16px; transition: all 0.2s;
+    }
+    .btn-golden:hover {
+      background: linear-gradient(135deg, rgba(245, 158, 11, 0.4), rgba(16, 185, 129, 0.4));
     }
     .toggle-row {
       display: flex; justify-content: space-between; align-items: center;
@@ -679,7 +726,6 @@ const HTML_UI = `<!DOCTYPE html>
       background: var(--surface); color: var(--text); cursor: pointer; font-size: 0.78rem; font-weight: 600;
     }
 
-    /* Login Modal */
     .modal-backdrop {
       position: fixed; inset: 0; background: rgba(0, 0, 0, 0.7); backdrop-filter: blur(6px);
       display: none; place-items: center; z-index: 100; padding: 16px;
@@ -707,7 +753,6 @@ const HTML_UI = `<!DOCTYPE html>
 </head>
 <body>
   <div class="container">
-    <!-- Top App Bar -->
     <header class="header">
       <div class="brand">
         <div class="brand-icon"><span class="material-symbols-rounded" style="color:white;font-size:26px;">bolt</span></div>
@@ -788,21 +833,26 @@ const HTML_UI = `<!DOCTYPE html>
 
     <!-- PROTECTED ADMIN STUDIO VIEW -->
     <div id="adminSection">
+      <!-- ONE-CLICK GOLDEN RESET BANNER -->
+      <button class="btn-golden" onclick="resetToGoldenDefaults()">
+        <span class="material-symbols-rounded">restart_alt</span>
+        <span>Reset to Tested Working Calibration (63.00 mV/A • 6.50mV Noise Floor • 0.24A Deadzone • Fan & Iron Defaults)</span>
+      </button>
+
       <div class="admin-grid">
         <!-- Left Column: Appliance Manager -->
         <div class="card">
           <div class="panel-title">
-            <span>🔌 Dynamic Appliance Profiles & Logging Rules</span>
+            <span>🔌 Dynamic Appliance Profiles (≥ 0.25A Recommended)</span>
             <button class="icon-btn" onclick="resetApplianceForm()">+ New Profile</button>
           </div>
 
-          <!-- Live Sensor Helper Banner -->
           <div style="padding:12px 14px;border-radius:12px;background:var(--primary-soft);border:1px solid rgba(99,102,241,0.3);margin-bottom:14px;font-size:0.84rem;">
-            📡 <strong>Live Uncalibrated Sensor Reading:</strong>
+            📡 <strong>Live Sensor Reading:</strong>
             <span id="adminLiveRaw" class="mono" style="color:#34d399;font-size:1rem;">0.000 A</span>
             (<span id="adminLiveMv" class="mono">0.00 mV</span>)
             <div style="color:var(--text-muted);font-size:0.76rem;margin-top:3px;">
-              Tip: Turn ON any new appliance (Fridge, Charger, Cooler) and see its live Amps above to set its Min/Max range below!
+              Note: Small loads below 0.24A (like phone chargers) are automatically filtered out to prevent Wi-Fi ripple false triggers.
             </div>
           </div>
 
@@ -811,7 +861,7 @@ const HTML_UI = `<!DOCTYPE html>
             <div class="form-grid">
               <div class="field">
                 <label>Appliance Name</label>
-                <input type="text" id="appName" placeholder="e.g. Fridge / Mobile Charger" required>
+                <input type="text" id="appName" placeholder="e.g. Ceiling Fan / Cooler" required>
               </div>
               <div class="field">
                 <label>Material Icon</label>
@@ -820,20 +870,19 @@ const HTML_UI = `<!DOCTYPE html>
                   <option value="mode_fan">Fan (mode_fan)</option>
                   <option value="kitchen">Fridge (kitchen)</option>
                   <option value="ac_unit">Cooler / AC (ac_unit)</option>
-                  <option value="smartphone">Mobile Charger (smartphone)</option>
-                  <option value="laptop_mac">Laptop Charger (laptop_mac)</option>
                   <option value="water_heater">Geyser / Heater (water_heater)</option>
                   <option value="tv">TV / Monitor (tv)</option>
+                  <option value="laptop_mac">Laptop / PC (laptop_mac)</option>
                   <option value="bolt">General Load (bolt)</option>
                 </select>
               </div>
               <div class="field">
                 <label>Min Current (Amps)</label>
-                <input type="number" step="0.001" id="appMin" placeholder="0.050" required>
+                <input type="number" step="0.01" id="appMin" placeholder="0.26" required>
               </div>
               <div class="field">
                 <label>Max Current (Amps)</label>
-                <input type="number" step="0.001" id="appMax" placeholder="0.180" required>
+                <input type="number" step="0.01" id="appMax" placeholder="0.55" required>
               </div>
               <div class="field">
                 <label>Calibration Multiplier (1.00 = Exact)</label>
@@ -872,15 +921,15 @@ const HTML_UI = `<!DOCTYPE html>
                 </div>
                 <div class="field">
                   <label>Zero Deadzone (Amps)</label>
-                  <input type="number" step="0.005" id="cfgDeadzone" required>
+                  <input type="number" step="0.01" id="cfgDeadzone" required>
                 </div>
                 <div class="field">
                   <label>Turn-ON Threshold (Amps)</label>
-                  <input type="number" step="0.005" id="cfgOnA" required>
+                  <input type="number" step="0.01" id="cfgOnA" required>
                 </div>
                 <div class="field">
                   <label>Turn-OFF Threshold (Amps)</label>
-                  <input type="number" step="0.005" id="cfgOffA" required>
+                  <input type="number" step="0.01" id="cfgOffA" required>
                 </div>
                 <div class="field">
                   <label>Nominal AC Voltage (V)</label>
@@ -893,7 +942,7 @@ const HTML_UI = `<!DOCTYPE html>
                 <div class="field">
                   <label>Log Unmatched Loads?</label>
                   <select id="cfgUnmatched">
-                    <option value="1">Yes (Log as Unknown Load)</option>
+                    <option value="1">Yes (Log as Other Load)</option>
                     <option value="0">No (Ignore Unmatched Loads)</option>
                   </select>
                 </div>
@@ -949,9 +998,6 @@ const HTML_UI = `<!DOCTYPE html>
         <span>🔐 Admin Studio Login</span>
         <button class="icon-btn" onclick="closeLoginModal()">✕</button>
       </div>
-      <p style="font-size:0.83rem;color:var(--text-muted);margin-bottom:14px;">
-        Enter your administrator credentials to configure appliances, calibration, and dashboard layout.
-      </p>
       <form onsubmit="submitLogin(event)">
         <div class="field" style="margin-bottom:12px;">
           <label>Username</label>
@@ -984,7 +1030,7 @@ const HTML_UI = `<!DOCTYPE html>
       const t = document.getElementById('toast');
       t.textContent = msg;
       t.style.display = 'block';
-      setTimeout(() => t.style.display = 'none', 3000);
+      setTimeout(() => t.style.display = 'none', 3500);
     }
 
     function formatClock(sec) {
@@ -1010,7 +1056,6 @@ const HTML_UI = `<!DOCTYPE html>
       document.getElementById('filterChipsWrap').style.display = settings.show_filters === '0' ? 'none' : 'flex';
       document.getElementById('clearBtnWrap').style.display = (settings.allow_public_clear === '1' || adminCreds.pass) ? 'inline-flex' : 'none';
 
-      // Render Dynamic Filter Chips based on configured Appliances
       const chipContainer = document.getElementById('filterChipsWrap');
       const baseChips = [
         { key: 'ALL', label: 'All Events' },
@@ -1048,7 +1093,6 @@ const HTML_UI = `<!DOCTYPE html>
       const costPerHr = (Number(live.power_w) / 1000) * rate;
       document.getElementById('liveCost').textContent = \`Est. Cost: ₹\${costPerHr.toFixed(2)} / hr (@ ₹\${rate}/kWh)\`;
 
-      // Update Admin Live Raw Helper
       const rawEl = document.getElementById('adminLiveRaw');
       if (rawEl) {
         rawEl.textContent = Number(live.raw_current_a ?? live.current_a).toFixed(3) + ' A';
@@ -1120,7 +1164,6 @@ const HTML_UI = `<!DOCTYPE html>
       }).join('');
     }
 
-    // ADMIN STUDIO FUNCTIONS
     function toggleAdminView() {
       if (isAdminView) {
         isAdminView = false;
@@ -1173,7 +1216,6 @@ const HTML_UI = `<!DOCTYPE html>
     }
 
     function populateAdminForms() {
-      // Populate Appliance List
       const box = document.getElementById('applianceList');
       box.innerHTML = appliances.map(a => \`
         <div class="app-item">
@@ -1186,7 +1228,7 @@ const HTML_UI = `<!DOCTYPE html>
               </span>
             </div>
             <div class="app-meta">
-              Range: \${Number(a.min_a).toFixed(3)}A – \${Number(a.max_a).toFixed(3)}A | Cal Factor: ×\${Number(a.cal_factor).toFixed(2)}
+              Range: \${Number(a.min_a).toFixed(2)}A – \${Number(a.max_a).toFixed(2)}A | Cal Factor: ×\${Number(a.cal_factor).toFixed(2)}
             </div>
           </div>
           <div style="display:flex;gap:6px;">
@@ -1196,12 +1238,11 @@ const HTML_UI = `<!DOCTYPE html>
         </div>
       \`).join('');
 
-      // Populate Global Calibration & Visibility Settings
       document.getElementById('cfgSens').value = settings.base_sensitivity || '63.00';
-      document.getElementById('cfgNoise').value = settings.noise_floor_mv || '5.20';
-      document.getElementById('cfgDeadzone').value = settings.deadzone_amps || '0.05';
-      document.getElementById('cfgOnA').value = settings.on_threshold_amps || '0.06';
-      document.getElementById('cfgOffA').value = settings.off_threshold_amps || '0.04';
+      document.getElementById('cfgNoise').value = settings.noise_floor_mv || '6.50';
+      document.getElementById('cfgDeadzone').value = settings.deadzone_amps || '0.24';
+      document.getElementById('cfgOnA').value = settings.on_threshold_amps || '0.26';
+      document.getElementById('cfgOffA').value = settings.off_threshold_amps || '0.20';
       document.getElementById('cfgVolt').value = settings.ac_voltage || '230';
       document.getElementById('cfgTariff').value = settings.tariff_rate || '8.5';
       document.getElementById('cfgUnmatched').value = settings.log_unmatched ?? '1';
@@ -1217,6 +1258,27 @@ const HTML_UI = `<!DOCTYPE html>
       document.getElementById('visCost').checked = settings.show_cost_est !== '0';
       document.getElementById('visFilters').checked = settings.show_filters !== '0';
       document.getElementById('visClear').checked = settings.allow_public_clear === '1';
+    }
+
+    async function resetToGoldenDefaults() {
+      if (!confirm('Restore Tested Working Calibration (63.00 mV/A, 6.50mV Noise, 0.24A Deadzone) and default Fan/Fridge/Iron profiles?')) return;
+      const res = await fetch('/api/admin/reset-defaults', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Admin-User': adminCreds.user,
+          'X-Admin-Pass': adminCreds.pass
+        },
+        body: JSON.stringify({ reset_appliances: true })
+      });
+      if (res.ok) {
+        const data = await res.json();
+        appliances = data.state.appliances;
+        settings = data.state.settings;
+        populateAdminForms();
+        applySettingsUI();
+        showToast('✅ Restored to Tested Working Calibration!');
+      }
     }
 
     function editAppliance(a) {
@@ -1264,9 +1326,6 @@ const HTML_UI = `<!DOCTYPE html>
       if (res.ok) {
         resetApplianceForm();
         showToast('Appliance profile saved!');
-      } else {
-        alert('Session expired, please login again.');
-        adminCreds.pass = '';
       }
     }
 
