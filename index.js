@@ -2,10 +2,15 @@ export class ApplianceLoggerDO {
   constructor(ctx, env) {
     this.ctx = ctx;
     this.sql = ctx.storage.sql;
+    this.initTables();
+  }
+
+  initTables() {
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         appliance TEXT,
+        icon TEXT DEFAULT 'bolt',
         event_type TEXT,
         current_a REAL,
         power_w REAL,
@@ -21,40 +26,145 @@ export class ApplianceLoggerDO {
         id INTEGER PRIMARY KEY CHECK (id = 1),
         state TEXT,
         appliance TEXT,
+        icon TEXT DEFAULT 'bolt',
         current_a REAL,
+        raw_current_a REAL DEFAULT 0,
         power_w REAL,
         signal_mv REAL,
         since_ms INTEGER,
         updated_ms INTEGER,
         esp_online INTEGER DEFAULT 1
       );
+      CREATE TABLE IF NOT EXISTS appliances (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        icon TEXT DEFAULT 'bolt',
+        min_a REAL NOT NULL,
+        max_a REAL NOT NULL,
+        cal_factor REAL DEFAULT 1.0,
+        log_enabled INTEGER DEFAULT 1,
+        active INTEGER DEFAULT 1
+      );
+      CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        val TEXT
+      );
     `);
-    try {
-      this.sql.exec(`ALTER TABLE logs ADD COLUMN note TEXT DEFAULT ''`);
-    } catch (e) {}
-    try {
-      this.sql.exec(`ALTER TABLE live_state ADD COLUMN esp_online INTEGER DEFAULT 1`);
-    } catch (e) {}
+
+    try { this.sql.exec(`ALTER TABLE logs ADD COLUMN icon TEXT DEFAULT 'bolt'`); } catch (e) {}
+    try { this.sql.exec(`ALTER TABLE logs ADD COLUMN note TEXT DEFAULT ''`); } catch (e) {}
+    try { this.sql.exec(`ALTER TABLE live_state ADD COLUMN icon TEXT DEFAULT 'bolt'`); } catch (e) {}
+    try { this.sql.exec(`ALTER TABLE live_state ADD COLUMN raw_current_a REAL DEFAULT 0`); } catch (e) {}
+    try { this.sql.exec(`ALTER TABLE live_state ADD COLUMN esp_online INTEGER DEFAULT 1`); } catch (e) {}
+
+    // Seed Default Appliances if empty
+    const count = this.sql.exec(`SELECT COUNT(*) as c FROM appliances`).toArray()[0].c;
+    if (count === 0) {
+      const defaults = [
+        ["Mobile / Small Charger", "smartphone", 0.05, 0.18, 1.00, 1],
+        ["Laptop Charger", "laptop_mac", 0.18, 0.28, 1.00, 1],
+        ["Ceiling / Table Fan", "mode_fan", 0.28, 0.55, 1.00, 1],
+        ["Fridge / Air Cooler", "kitchen", 0.55, 1.80, 1.00, 1],
+        ["Electric Iron (Press)", "iron", 1.80, 4.15, 1.00, 1],
+        ["Iron + Fan (Combined)", "bolt", 4.15, 15.00, 1.00, 1]
+      ];
+      for (const a of defaults) {
+        this.sql.exec(
+          `INSERT INTO appliances (name, icon, min_a, max_a, cal_factor, log_enabled, active) VALUES (?, ?, ?, ?, ?, ?, 1)`,
+          a[0], a[1], a[2], a[3], a[4], a[5]
+        );
+      }
+    }
+
+    // Seed Default Settings if empty
+    const defaultCfg = {
+      admin_user: "admin",
+      admin_pass: "vikas@123",
+      dashboard_title: "ESP32 Smart Appliance Telemetry",
+      dashboard_subtitle: "Dynamic Cloud-Calibrated True-RMS Power & Session Logger",
+      ac_voltage: "230",
+      tariff_rate: "8.5",
+      base_sensitivity: "63.00",
+      noise_floor_mv: "5.20",
+      deadzone_amps: "0.05",
+      on_threshold_amps: "0.06",
+      off_threshold_amps: "0.04",
+       log_unmatched: "1",
+      show_state_card: "1",
+      show_current_card: "1",
+      show_power_card: "1",
+      show_timer_card: "1",
+      show_signal_mv: "1",
+      show_cost_est: "1",
+      show_filters: "1",
+      allow_public_clear: "0"
+    };
+
+    for (const [k, v] of Object.entries(defaultCfg)) {
+      this.sql.exec(`INSERT OR IGNORE INTO settings (key, val) VALUES (?, ?)`, k, v);
+    }
+  }
+
+  getSettingsObj() {
+    const rows = this.sql.exec(`SELECT key, val FROM settings`).toArray();
+    const obj = {};
+    for (const r of rows) obj[r.key] = r.val;
+    return obj;
+  }
+
+  getPublicSettings() {
+    const s = this.getSettingsObj();
+    delete s.admin_pass;
+    return s;
+  }
+
+  getAppliances() {
+    return this.sql.exec(`SELECT * FROM appliances ORDER BY min_a ASC`).toArray();
+  }
+
+  checkAuth(request) {
+    const s = this.getSettingsObj();
+    const u = request.headers.get("X-Admin-User") || "";
+    const p = request.headers.get("X-Admin-Pass") || "";
+    return (u === s.admin_user && p === s.admin_pass);
+  }
+
+  matchAppliance(rawAmps, cfg) {
+    const offThresh = Number(cfg.off_threshold_amps || 0.04);
+    if (rawAmps < offThresh) {
+      return { name: "None", icon: "power_settings_new", cal_factor: 1.0, log_enabled: 0, matched: false };
+    }
+    const list = this.sql.exec(`SELECT * FROM appliances WHERE active = 1 ORDER BY min_a ASC`).toArray();
+    for (const app of list) {
+      if (rawAmps >= app.min_a && rawAmps <= app.max_a) {
+        return {
+          name: app.name,
+          icon: app.icon || "bolt",
+          cal_factor: Number(app.cal_factor || 1.0),
+          log_enabled: Number(app.log_enabled),
+          matched: true
+        };
+      }
+    }
+    return {
+      name: `Unknown Load (${rawAmps.toFixed(2)}A)`,
+      icon: "electrical_services",
+      cal_factor: 1.0,
+      log_enabled: Number(cfg.log_unmatched ?? 1),
+      matched: true
+    };
   }
 
   formatIST(ms) {
     const d = new Date(ms);
     const date_str = new Intl.DateTimeFormat('en-IN', {
-      timeZone: 'Asia/Kolkata',
-      day: '2-digit',
-      month: 'short',
-      year: 'numeric'
+      timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric'
     }).format(d);
     const day_str = new Intl.DateTimeFormat('en-IN', {
-      timeZone: 'Asia/Kolkata',
-      weekday: 'long'
+      timeZone: 'Asia/Kolkata', weekday: 'long'
     }).format(d);
     const time_str = new Intl.DateTimeFormat('en-IN', {
-      timeZone: 'Asia/Kolkata',
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit',
-      hour12: true
+      timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true
     }).format(d);
     return { date_str, day_str, time_str };
   }
@@ -76,32 +186,30 @@ export class ApplianceLoggerDO {
       type: "SYNC",
       live: liveRows.length ? liveRows[0] : null,
       logs,
+      appliances: this.getAppliances(),
+      settings: this.getPublicSettings(),
       server_time: Date.now()
     };
   }
 
   broadcast(dataObj) {
     const msg = JSON.stringify(dataObj);
-    const sockets = this.ctx.getWebSockets();
-    for (const ws of sockets) {
+    for (const ws of this.ctx.getWebSockets()) {
       try { ws.send(msg); } catch (e) {}
     }
   }
 
-  // Automatic 10-Second Watchdog Alarm when ESP32 loses Power or Internet!
   async alarm() {
     const rows = this.sql.exec(`SELECT * FROM live_state WHERE id = 1`).toArray();
     if (!rows.length) return;
     const prev = rows[0];
-    const now = Date.now();
-
-    if (now - prev.updated_ms >= 9000 && prev.esp_online === 1) {
+    if (Date.now() - prev.updated_ms >= 9000 && prev.esp_online === 1) {
       this.sql.exec(`UPDATE live_state SET esp_online = 0 WHERE id = 1`);
       this.broadcast(this.getFullState());
     }
   }
 
-  insertLogRow(appliance, event, current_a, power_w, eventTimeMs, noteStr, knownDurationSec = 0) {
+  insertLogRow(appliance, icon, event, current_a, power_w, eventTimeMs, noteStr, knownDurationSec = 0) {
     const { date_str, day_str, time_str } = this.formatIST(eventTimeMs);
     let duration_sec = knownDurationSec;
 
@@ -115,14 +223,13 @@ export class ApplianceLoggerDO {
     }
 
     let duration_str = event === "OFF" ? this.formatDuration(duration_sec) : "Running Live...";
-    if (noteStr) {
-      duration_str = `${duration_str} (${noteStr})`;
-    }
+    if (noteStr) duration_str = `${duration_str} (${noteStr})`;
 
     this.sql.exec(
-      `INSERT INTO logs (appliance, event_type, current_a, power_w, date_str, day_str, time_str, duration_sec, duration_str, timestamp_ms, note)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO logs (appliance, icon, event_type, current_a, power_w, date_str, day_str, time_str, duration_sec, duration_str, timestamp_ms, note)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       appliance || "Appliance",
+      icon || "bolt",
       event,
       Number(current_a || 0),
       Number(power_w || 0),
@@ -148,16 +255,14 @@ export class ApplianceLoggerDO {
     const url = new URL(request.url);
     const cors = {
       "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type",
+      "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type, X-Admin-User, X-Admin-Pass",
       "Connection": "keep-alive"
     };
 
-    if (request.method === "OPTIONS") {
-      return new Response(null, { headers: cors });
-    }
+    if (request.method === "OPTIONS") return new Response(null, { headers: cors });
 
-    // 1. Real-Time WebSocket Endpoint
+    // 1. WebSocket Stream
     if (url.pathname === "/api/ws") {
       if (request.headers.get("Upgrade") !== "websocket") {
         return new Response("Expected WebSocket", { status: 426 });
@@ -169,100 +274,95 @@ export class ApplianceLoggerDO {
       return new Response(null, { status: 101, webSocket: client });
     }
 
-    // 2. ESP32 Telemetry, Offline Sync & Power-Recovery Endpoint
+    // 2. ESP32 Telemetry & Dynamic Config Sync Endpoint
     if (url.pathname === "/api/update" && request.method === "POST") {
       const body = await request.json();
       const now = Date.now();
+      const cfg = this.getSettingsObj();
+      const acVolt = Number(cfg.ac_voltage || 230);
+      const onThresh = Number(cfg.on_threshold_amps || 0.06);
+      const offThresh = Number(cfg.off_threshold_amps || 0.04);
+
       const {
-        event,          // "ON", "OFF", "HEARTBEAT", "BOOT_SYNC"
-        appliance,
+        event,
         current_a,
-        power_w,
         signal_mv,
         duration_sec,
-        event_epoch_ms, // Sent when flushing offline queued events!
+        event_epoch_ms,
         is_offline_sync
       } = body;
 
-      // Schedule watchdog alarm 10 seconds in the future
       await this.ctx.storage.setAlarm(now + 10000);
-
-      // Use original NTP timestamp if ESP32 is syncing an offline-queued event!
       const effectiveTimeMs = (event_epoch_ms && event_epoch_ms > 1700000000000) ? Number(event_epoch_ms) : now;
+
+      const rawAmps = Number(current_a || 0);
+      const matched = this.matchAppliance(rawAmps, cfg);
+      const calibratedAmps = rawAmps >= offThresh ? (rawAmps * matched.cal_factor) : 0.0;
+      const calibratedPower = calibratedAmps * acVolt;
 
       const prevRows = this.sql.exec(`SELECT * FROM live_state WHERE id = 1`).toArray();
       const prev = prevRows.length ? prevRows[0] : null;
 
-      const currentState = (event === "OFF" || Number(current_a) < 0.20) ? "OFF" : "ON";
+      const currentState = (event === "OFF" || calibratedAmps < offThresh) ? "OFF" : (calibratedAmps >= onThresh ? "ON" : (prev ? prev.state : "OFF"));
       let since_ms = prev ? prev.since_ms : effectiveTimeMs;
       let logsUpdated = false;
 
-      // --- CASE 2B & 2C: POWER-LOSS / REBOOT RECONCILIATION ---
-      if (event === "ON") {
-        if (prev && prev.state === "ON") {
-          // Sub-Case 2B: Appliance was ALREADY ON before ESP32 rebooted!
-          // Do NOT create a duplicate ON row; keep original since_ms timer running!
-          since_ms = prev.since_ms;
-        } else {
+      if (event === "ON" || (currentState === "ON" && (!prev || prev.state === "OFF"))) {
+        if (!prev || prev.state === "OFF" || is_offline_sync) {
           since_ms = effectiveTimeMs;
-          logsUpdated = true;
-          const note = is_offline_sync ? "Synced after Net Restore" : "";
-          this.insertLogRow(appliance, "ON", current_a, power_w, effectiveTimeMs, note, 0);
+          if (matched.log_enabled === 1) {
+            logsUpdated = true;
+            const note = is_offline_sync ? "Synced after Net Restore" : "";
+            this.insertLogRow(matched.name, matched.icon, "ON", calibratedAmps, calibratedPower, effectiveTimeMs, note, 0);
+          }
         }
-      } else if (event === "OFF") {
+      } else if (event === "OFF" || (currentState === "OFF" && prev && prev.state === "ON")) {
         if (!prev || prev.state === "ON" || is_offline_sync) {
           since_ms = effectiveTimeMs;
-          logsUpdated = true;
-          const note = is_offline_sync ? "Synced after Net Restore" : "";
-          this.insertLogRow(appliance, "OFF", 0.0, 0.0, effectiveTimeMs, note, Number(duration_sec || 0));
+          const prevApp = is_offline_sync && matched.name !== "None" ? matched.name : (prev ? prev.appliance : "Appliance");
+          const prevIcon = prev ? prev.icon : matched.icon;
+          // Check if previous appliance had logging enabled
+          const prevMatch = this.sql.exec(`SELECT log_enabled FROM appliances WHERE name = ?`, prevApp).toArray();
+          const shouldLogOff = prevMatch.length ? Number(prevMatch[0].log_enabled) === 1 : true;
+
+          if (shouldLogOff) {
+            logsUpdated = true;
+            let note = is_offline_sync ? "Synced after Net Restore" : "";
+            if (event === "BOOT_SYNC") note = "Auto-Closed after ESP Power Loss";
+            this.insertLogRow(prevApp, prevIcon, "OFF", 0.0, 0.0, effectiveTimeMs, note, Number(duration_sec || 0));
+          }
         }
-      } else if (event === " HEARTBEAT" || event === "HEARTBEAT" || event === "BOOT_SYNC") {
-        // Sub-Case 2C: Appliance was ON in DB, ESP32 lost power, appliance turned OFF while ESP32 was dead,
-        // and now ESP32 booted up reporting 0.000A (OFF)!
-        if (prev && prev.state === "ON" && currentState === "OFF") {
+      } else if (currentState === "ON" && prev && prev.state === "ON" && matched.name !== prev.appliance && matched.name !== "None") {
+        // Appliance switched mid-session (e.g. Fan was ON, then Iron also turned ON, or switched load)
+        if (matched.log_enabled === 1) {
           logsUpdated = true;
-          since_ms = now;
-          this.insertLogRow(
-            prev.appliance || "Appliance",
-            "OFF",
-            0.0,
-            0.0,
-            now,
-            "Auto-Closed after ESP Power/Net Loss",
-            0
-          );
-        } else if ((!prev || prev.state === "OFF") && currentState === "ON") {
-          // Appliance turned ON while ESP32 was dead, and ESP32 just booted seeing current!
-          logsUpdated = true;
-          since_ms = now;
-          this.insertLogRow(
-            appliance || "Appliance",
-            "ON",
-            current_a,
-            power_w,
-            now,
-            "Detected on ESP Recovery",
-            0
-          );
+          this.insertLogRow(matched.name, matched.icon, "ON", calibratedAmps, calibratedPower, now, `Switched from ${prev.appliance}`, 0);
         }
       }
 
+      const finalAppName = currentState === "OFF" ? "None" : matched.name;
+      const finalIcon = currentState === "OFF" ? "power_settings_new" : matched.icon;
+
       this.sql.exec(
-        `INSERT INTO live_state (id, state, appliance, current_a, power_w, signal_mv, since_ms, updated_ms, esp_online)
-         VALUES (1, ?, ?, ?, ?, ?, ?, ?, 1)
+        `INSERT INTO live_state (id, state, appliance, icon, current_a, raw_current_a, power_w, signal_mv, since_ms, updated_ms, esp_online)
+         VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
          ON CONFLICT(id) DO UPDATE SET
            state=excluded.state,
            appliance=excluded.appliance,
+           icon=excluded.icon,
            current_a=excluded.current_a,
+           raw_current_a=excluded.raw_current_a,
            power_w=excluded.power_w,
            signal_mv=excluded.signal_mv,
            since_ms=excluded.since_ms,
            updated_ms=excluded.updated_ms,
            esp_online=1`,
         currentState,
-        currentState === "OFF" ? "None" : (appliance || "Appliance"),
-        Number(current_a || 0),
-        Number(power_w || 0),
+        finalAppName,
+        finalIcon,
+        calibratedAmps,
+        rawAmps,
+        calibratedPower,
         Number(signal_mv || 0),
         since_ms,
         now
@@ -275,9 +375,11 @@ export class ApplianceLoggerDO {
           type: "LIVE",
           live: {
             state: currentState,
-            appliance: currentState === "OFF" ? "None" : (appliance || "None"),
-            current_a: Number(current_a || 0),
-            power_w: Number(power_w || 0),
+            appliance: finalAppName,
+            icon: finalIcon,
+            current_a: calibratedAmps,
+            raw_current_a: rawAmps,
+            power_w: calibratedPower,
             signal_mv: Number(signal_mv || 0),
             since_ms,
             updated_ms: now,
@@ -287,16 +389,109 @@ export class ApplianceLoggerDO {
         });
       }
 
-      return new Response("OK", { headers: cors });
+      // Return latest calibration parameters to ESP32 so ESP32 auto-tunes itself!
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          cfg: {
+            sens: Number(cfg.base_sensitivity || 63.0),
+            noise: Number(cfg.noise_floor_mv || 5.2),
+            deadzone: Number(cfg.deadzone_amps || 0.05),
+            on_a: onThresh,
+            off_a: offThresh
+          }
+        }),
+        { headers: { ...cors, "Content-Type": "application/json" } }
+      );
     }
 
+    // 3. Status Endpoint
     if (url.pathname === "/api/status" && request.method === "GET") {
       return new Response(JSON.stringify(this.getFullState()), {
         headers: { ...cors, "Content-Type": "application/json" }
       });
     }
 
+    // 4. Admin Login Verification
+    if (url.pathname === "/api/admin/login" && request.method === "POST") {
+      const { username, password } = await request.json();
+      const s = this.getSettingsObj();
+      if (username === s.admin_user && password === s.admin_pass) {
+        return new Response(JSON.stringify({ ok: true, state: this.getFullState() }), {
+          headers: { ...cors, "Content-Type": "application/json" }
+        });
+      }
+      return new Response(JSON.stringify({ ok: false, error: "Invalid Admin Username or Password" }), {
+        status: 401,
+        headers: { ...cors, "Content-Type": "application/json" }
+      });
+    }
+
+    // 5. Admin Protected Routes (Appliance CRUD + Settings + Calibration)
+    if (url.pathname.startsWith("/api/admin/")) {
+      if (!this.checkAuth(request)) {
+        return new Response(JSON.stringify({ error: "Unauthorized" }), {
+          status: 401,
+          headers: { ...cors, "Content-Type": "application/json" }
+        });
+      }
+
+      if (url.pathname === "/api/admin/appliance" && request.method === "POST") {
+        const b = await request.json();
+        if (b.id) {
+          this.sql.exec(
+            `UPDATE appliances SET name=?, icon=?, min_a=?, max_a=?, cal_factor=?, log_enabled=?, active=? WHERE id=?`,
+            b.name, b.icon || "bolt", Number(b.min_a), Number(b.max_a), Number(b.cal_factor || 1.0), b.log_enabled ? 1 : 0, b.active ? 1 : 0, Number(b.id)
+          );
+        } else {
+          this.sql.exec(
+            `INSERT INTO appliances (name, icon, min_a, max_a, cal_factor, log_enabled, active) VALUES (?, ?, ?, ?, ?, ?, 1)`,
+            b.name, b.icon || "bolt", Number(b.min_a), Number(b.max_a), Number(b.cal_factor || 1.0), b.log_enabled ? 1 : 0
+          );
+        }
+        const st = this.getFullState();
+        this.broadcast(st);
+        return new Response(JSON.stringify({ ok: true, state: st }), {
+          headers: { ...cors, "Content-Type": "application/json" }
+        });
+      }
+
+      if (url.pathname === "/api/admin/appliance" && request.method === "DELETE") {
+        const id = Number(url.searchParams.get("id"));
+        this.sql.exec(`DELETE FROM appliances WHERE id = ?`, id);
+        const st = this.getFullState();
+        this.broadcast(st);
+        return new Response(JSON.stringify({ ok: true, state: st }), {
+          headers: { ...cors, "Content-Type": "application/json" }
+        });
+      }
+
+      if (url.pathname === "/api/admin/settings" && request.method === "POST") {
+        const body = await request.json();
+        for (const [k, v] of Object.entries(body)) {
+          if (k === "admin_pass" && (!v || String(v).trim() === "")) continue;
+          this.sql.exec(
+            `INSERT INTO settings (key, val) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET val = excluded.val`,
+            k, String(v)
+          );
+        }
+        const st = this.getFullState();
+        this.broadcast(st);
+        return new Response(JSON.stringify({ ok: true, state: st }), {
+          headers: { ...cors, "Content-Type": "application/json" }
+        });
+      }
+    }
+
+    // 6. Clear History Logs
     if (url.pathname === "/api/clear" && request.method === "DELETE") {
+      const s = this.getSettingsObj();
+      if (s.allow_public_clear !== "1" && !this.checkAuth(request)) {
+        return new Response(JSON.stringify({ error: "Admin login required to clear logs" }), {
+          status: 403,
+          headers: { ...cors, "Content-Type": "application/json" }
+        });
+      }
       this.sql.exec(`DELETE FROM logs`);
       this.broadcast(this.getFullState());
       return new Response(JSON.stringify({ ok: true }), {
@@ -321,7 +516,6 @@ export default {
       const stub = env.LOGGER_DO.get(id);
       return stub.fetch(request);
     }
-
     return new Response(HTML_UI, {
       headers: { "Content-Type": "text/html; charset=utf-8" }
     });
@@ -333,7 +527,7 @@ const HTML_UI = `<!DOCTYPE html>
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Real-Time Appliance Telemetry • Material 3</title>
+  <title>Smart Appliance Telemetry & Admin Studio</title>
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
   <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@24,500,1,0" rel="stylesheet" />
   <style>
@@ -341,189 +535,457 @@ const HTML_UI = `<!DOCTYPE html>
       --bg: #0b0f19;
       --surface: #131b2e;
       --surface-2: #1c2742;
-      --border: rgba(255, 255, 255, 0.08);
+      --border: rgba(255, 255, 255, 0.09);
       --primary: #6366f1;
-      --primary-soft: rgba(99, 102, 241, 0.15);
+      --primary-soft: rgba(99, 102, 241, 0.16);
       --success: #10b981;
-      --success-soft: rgba(16, 185, 129, 0.15);
+      --success-soft: rgba(16, 185, 129, 0.16);
       --danger: #f43f5e;
-      --danger-soft: rgba(244, 63, 94, 0.15);
+      --danger-soft: rgba(244, 63, 94, 0.16);
       --warn: #f59e0b;
       --warn-soft: rgba(245, 158, 11, 0.18);
       --text: #f8fafc;
       --text-muted: #94a3b8;
-      --radius-lg: 24px;
+      --radius-lg: 22px;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
       font-family: 'Plus Jakarta Sans', sans-serif;
-      background: radial-gradient(circle at top right, #1e1b4b, var(--bg) 50%);
+      background: radial-gradient(circle at top right, #1e1b4b, var(--bg) 55%);
       color: var(--text);
       min-height: 100vh;
-      padding: 20px;
+      padding: 18px;
     }
-    .container { max-width: 1200px; margin: 0 auto; }
+    .container { max-width: 1240px; margin: 0 auto; }
+
+    /* Top Header */
     .header {
-      display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 16px;
-      padding: 18px 24px; background: rgba(19, 27, 46, 0.85); backdrop-filter: blur(16px);
+      display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 14px;
+      padding: 16px 22px; background: rgba(19, 27, 46, 0.88); backdrop-filter: blur(16px);
       border: 1px solid var(--border); border-radius: var(--radius-lg); margin-bottom: 18px;
     }
     .brand { display: flex; align-items: center; gap: 14px; }
     .brand-icon {
-      width: 48px; height: 48px; border-radius: 16px;
+      width: 46px; height: 46px; border-radius: 14px;
       background: linear-gradient(135deg, #6366f1, #8b5cf6);
       display: grid; place-items: center; box-shadow: 0 8px 20px rgba(99, 102, 241, 0.35);
     }
-    .brand h1 { font-size: 1.25rem; font-weight: 800; }
-    .brand p { font-size: 0.82rem; color: var(--text-muted); }
+    .brand h1 { font-size: 1.2rem; font-weight: 800; }
+    .brand p { font-size: 0.8rem; color: var(--text-muted); }
+    .header-right { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+
     .conn-pill {
       display: inline-flex; align-items: center; gap: 8px;
-      padding: 8px 16px; border-radius: 999px; font-size: 0.82rem; font-weight: 700;
+      padding: 8px 14px; border-radius: 999px; font-size: 0.8rem; font-weight: 700;
       background: var(--surface-2); border: 1px solid var(--border);
     }
-    .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--danger); }
+    .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--danger); }
     .dot.online { background: var(--success); box-shadow: 0 0 12px var(--success); animation: pulse 1.2s infinite; }
     @keyframes pulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.3); opacity: 0.7; } }
 
+    .btn-admin {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 8px 16px; border-radius: 999px; font-size: 0.82rem; font-weight: 700;
+      background: var(--primary-soft); color: #a5b4fc; border: 1px solid rgba(99, 102, 241, 0.35);
+      cursor: pointer; transition: all 0.2s;
+    }
+    .btn-admin:hover, .btn-admin.active { background: var(--primary); color: white; }
+
     .offline-banner {
       display: none; align-items: center; gap: 12px;
-      padding: 14px 20px; border-radius: 16px; margin-bottom: 20px;
+      padding: 13px 18px; border-radius: 16px; margin-bottom: 18px;
       background: var(--warn-soft); border: 1px solid rgba(245, 158, 11, 0.45); color: #fcd34d;
-      font-size: 0.9rem; font-weight: 600;
+      font-size: 0.88rem; font-weight: 600;
     }
 
-    .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 18px; margin-bottom: 24px; }
-    .card {
-      background: rgba(19, 27, 46, 0.85); border: 1px solid var(--border);
-      border-radius: var(--radius-lg); padding: 22px; transition: all 0.15s ease;
+    /* Live Cards Grid */
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 16px;
+      margin-bottom: 22px;
     }
-    .card-head { display: flex; justify-content: space-between; align-items: center; color: var(--text-muted); font-size: 0.82rem; font-weight: 700; margin-bottom: 12px; }
-    .card-value { font-family: 'JetBrains Mono', monospace; font-size: 2rem; font-weight: 700; margin-bottom: 6px; }
+    .card {
+      background: rgba(19, 27, 46, 0.88); border: 1px solid var(--border);
+      border-radius: var(--radius-lg); padding: 20px; transition: all 0.15s ease;
+    }
+    .card-head { display: flex; justify-content: space-between; align-items: center; color: var(--text-muted); font-size: 0.78rem; font-weight: 700; margin-bottom: 10px; text-transform: uppercase; letter-spacing: 0.04em; }
+    .card-value { font-family: 'JetBrains Mono', monospace; font-size: 1.85rem; font-weight: 700; margin-bottom: 6px; }
     .card-sub { font-size: 0.8rem; color: var(--text-muted); }
     .state-on {
       background: linear-gradient(135deg, rgba(16, 185, 129, 0.22), rgba(19, 27, 46, 0.92));
       border-color: rgba(16, 185, 129, 0.5);
-      box-shadow: 0 0 25px rgba(16, 185, 129, 0.15);
     }
+
+    /* Toolbar & Filters */
     .toolbar { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; margin-bottom: 16px; }
     .chips { display: flex; gap: 8px; flex-wrap: wrap; }
     .chip {
-      padding: 8px 16px; border-radius: 999px; font-size: 0.85rem; font-weight: 600;
+      padding: 7px 15px; border-radius: 999px; font-size: 0.82rem; font-weight: 600;
       cursor: pointer; border: 1px solid var(--border); background: var(--surface); color: var(--text-muted);
     }
     .chip.active { background: var(--primary); color: white; border-color: var(--primary); }
     .btn-danger {
-      display: inline-flex; align-items: center; gap: 6px; padding: 8px 16px; border-radius: 12px;
-      border: 1px solid rgba(244, 63, 94, 0.3); background: var(--danger-soft); color: #fda4af; font-size: 0.84rem; font-weight: 600; cursor: pointer;
+      display: inline-flex; align-items: center; gap: 6px; padding: 8px 14px; border-radius: 12px;
+      border: 1px solid rgba(244, 63, 94, 0.3); background: var(--danger-soft); color: #fda4af; font-size: 0.82rem; font-weight: 600; cursor: pointer;
     }
-    .table-card { background: rgba(19, 27, 46, 0.85); border: 1px solid var(--border); border-radius: var(--radius-lg); overflow: hidden; }
+
+    /* Table */
+    .table-card { background: rgba(19, 27, 46, 0.88); border: 1px solid var(--border); border-radius: var(--radius-lg); overflow: hidden; }
     .table-wrap { width: 100%; overflow-x: auto; }
     table { width: 100%; border-collapse: collapse; text-align: left; }
-    th { padding: 16px 20px; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-muted); background: rgba(28, 39, 66, 0.5); border-bottom: 1px solid var(--border); }
-    td { padding: 16px 20px; font-size: 0.92rem; border-bottom: 1px solid var(--border); }
-    .badge { display: inline-flex; align-items: center; gap: 6px; padding: 5px 12px; border-radius: 999px; font-size: 0.78rem; font-weight: 700; }
+    th { padding: 15px 18px; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-muted); background: rgba(28, 39, 66, 0.5); border-bottom: 1px solid var(--border); }
+    td { padding: 14px 18px; font-size: 0.9rem; border-bottom: 1px solid var(--border); }
+    .badge { display: inline-flex; align-items: center; gap: 5px; padding: 4px 11px; border-radius: 999px; font-size: 0.76rem; font-weight: 700; }
     .badge-on { background: var(--success-soft); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.3); }
     .badge-off { background: var(--danger-soft); color: #fb7185; border: 1px solid rgba(244, 63, 94, 0.3); }
-    .app-tag { display: inline-flex; align-items: center; gap: 6px; font-weight: 700; }
+    .app-tag { display: inline-flex; align-items: center; gap: 7px; font-weight: 700; }
     .mono { font-family: 'JetBrains Mono', monospace; font-weight: 600; }
-    .duration-pill { display: inline-flex; align-items: center; gap: 5px; padding: 4px 10px; border-radius: 8px; background: var(--primary-soft); color: #a5b4fc; font-family: 'JetBrains Mono', monospace; font-size: 0.82rem; font-weight: 600; }
-    .empty-state { padding: 48px 20px; text-align: center; color: var(--text-muted); }
+    .duration-pill { display: inline-flex; align-items: center; gap: 5px; padding: 4px 10px; border-radius: 8px; background: var(--primary-soft); color: #a5b4fc; font-family: 'JetBrains Mono', monospace; font-size: 0.8rem; font-weight: 600; }
+    .empty-state { padding: 42px 20px; text-align: center; color: var(--text-muted); }
 
-    @media (max-width: 992px) { .grid { grid-template-columns: repeat(2, 1fr); } }
+    /* ADMIN STUDIO PANEL */
+    #adminSection { display: none; margin-top: 10px; }
+    .admin-grid { display: grid; grid-template-columns: 1.35fr 1fr; gap: 18px; margin-bottom: 24px; }
+    .panel-title { font-size: 1.05rem; font-weight: 800; margin-bottom: 14px; display: flex; justify-content: space-between; align-items: center; }
+    .form-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }
+    .field { display: flex; flex-direction: column; gap: 5px; }
+    .field label { font-size: 0.75rem; color: var(--text-muted); font-weight: 700; text-transform: uppercase; }
+    .field input, .field select {
+      padding: 10px 12px; border-radius: 10px; border: 1px solid var(--border);
+      background: #0b0f19; color: white; font-size: 0.88rem; outline: none;
+    }
+    .field input:focus, .field select:focus { border-color: var(--primary); }
+    .btn-primary {
+      display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+      padding: 11px 18px; border-radius: 12px; border: none; cursor: pointer;
+      background: linear-gradient(135deg, #6366f1, #8b5cf6); color: white; font-weight: 700; font-size: 0.88rem;
+    }
+    .toggle-row {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 10px 14px; border-radius: 12px; background: rgba(28, 39, 66, 0.45);
+      border: 1px solid var(--border); margin-bottom: 8px; font-size: 0.88rem; font-weight: 600;
+    }
+    .toggle-row input[type="checkbox"] { width: 18px; height: 18px; accent-color: var(--primary); cursor: pointer; }
+
+    .app-item {
+      display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;
+      padding: 12px 14px; border-radius: 14px; background: rgba(28, 39, 66, 0.5);
+      border: 1px solid var(--border); margin-bottom: 10px;
+    }
+    .app-meta { font-size: 0.78rem; color: var(--text-muted); font-family: 'JetBrains Mono', monospace; margin-top: 3px; }
+    .icon-btn {
+      padding: 6px 10px; border-radius: 8px; border: 1px solid var(--border);
+      background: var(--surface); color: var(--text); cursor: pointer; font-size: 0.78rem; font-weight: 600;
+    }
+
+    /* Login Modal */
+    .modal-backdrop {
+      position: fixed; inset: 0; background: rgba(0, 0, 0, 0.7); backdrop-filter: blur(6px);
+      display: none; place-items: center; z-index: 100; padding: 16px;
+    }
+    .modal {
+      background: var(--surface); border: 1px solid var(--border); border-radius: 22px;
+      padding: 26px; width: 100%; max-width: 400px;
+    }
+    .toast {
+      position: fixed; bottom: 20px; right: 20px; padding: 12px 20px; border-radius: 12px;
+      background: var(--success); color: #052e16; font-weight: 800; display: none; z-index: 200;
+    }
+
+    @media (max-width: 960px) { .admin-grid { grid-template-columns: 1fr; } }
     @media (max-width: 640px) {
       body { padding: 12px; }
-      .grid { grid-template-columns: 1fr; gap: 12px; }
+      .form-grid { grid-template-columns: 1fr; }
       thead { display: none; }
       table, tbody, tr, td { display: block; width: 100%; }
-      tr { padding: 16px; border-bottom: 1px solid var(--border); }
-      td { padding: 6px 0; border: none; display: flex; justify-content: space-between; align-items: center; }
-      td::before { content: attr(data-label); color: var(--text-muted); font-size: 0.78rem; font-weight: 600; text-transform: uppercase; }
+      tr { padding: 14px; border-bottom: 1px solid var(--border); }
+      td { padding: 5px 0; border: none; display: flex; justify-content: space-between; align-items: center; }
+      td::before { content: attr(data-label); color: var(--text-muted); font-size: 0.75rem; font-weight: 700; text-transform: uppercase; }
     }
   </style>
 </head>
 <body>
   <div class="container">
+    <!-- Top App Bar -->
     <header class="header">
       <div class="brand">
-        <div class="brand-icon"><span class="material-symbols-rounded" style="color:white;font-size:28px;">bolt</span></div>
+        <div class="brand-icon"><span class="material-symbols-rounded" style="color:white;font-size:26px;">bolt</span></div>
         <div>
-          <h1>ESP32 Appliance Telemetry</h1>
-          <p>Fault-Tolerant Stream • Offline Queue & Power-Loss Recovery</p>
+          <h1 id="uiTitle">ESP32 Smart Appliance Telemetry</h1>
+          <p id="uiSubtitle">Dynamic Cloud-Calibrated True-RMS Power & Session Logger</p>
         </div>
       </div>
-      <div class="conn-pill">
-        <span id="connDot" class="dot"></span>
-        <span id="connText">Connecting...</span>
+      <div class="header-right">
+        <div class="conn-pill">
+          <span id="connDot" class="dot"></span>
+          <span id="connText">Connecting...</span>
+        </div>
+        <button id="adminBtn" class="btn-admin" onclick="toggleAdminView()">
+          <span class="material-symbols-rounded" style="font-size:18px;">admin_panel_settings</span>
+          <span id="adminBtnText">Admin Studio</span>
+        </button>
       </div>
     </header>
 
     <div id="offlineBanner" class="offline-banner">
       <span class="material-symbols-rounded">warning</span>
-      <span id="offlineText">ESP32 Power or Internet Lost! Waiting for reconnection (Offline events will auto-sync)...</span>
+      <span>ESP32 Power or Internet Lost! Offline events will auto-sync on reconnection.</span>
     </div>
 
-    <section class="grid">
-      <div id="stateCard" class="card">
-        <div class="card-head"><span>CURRENT STATE</span><span class="material-symbols-rounded">power_settings_new</span></div>
-        <div id="liveState" class="card-value">OFF</div>
-        <div id="liveAppliance" class="card-sub">Appliance: None</div>
-      </div>
-      <div class="card">
-        <div class="card-head"><span>LIVE CURRENT (RMS)</span><span class="material-symbols-rounded">electric_meter</span></div>
-        <div id="liveCurrent" class="card-value">0.000 A</div>
-        <div id="liveSignal" class="card-sub">ADC Signal: 0.00 mV</div>
-      </div>
-      <div class="card">
-        <div class="card-head"><span>ACTIVE POWER</span><span class="material-symbols-rounded">speed</span></div>
-        <div id="livePower" class="card-value">0.0 W</div>
-        <div class="card-sub">At 230V AC Nominal</div>
-      </div>
-      <div class="card">
-        <div class="card-head"><span>ACTIVE SESSION TIMER</span><span class="material-symbols-rounded">timer</span></div>
-        <div id="liveTimer" class="card-value">00:00</div>
-        <div id="liveSince" class="card-sub">Idle</div>
-      </div>
-    </section>
+    <!-- MAIN PUBLIC DASHBOARD VIEW -->
+    <div id="dashboardSection">
+      <section class="grid">
+        <div id="cardStateWrap" class="card">
+          <div class="card-head"><span>CURRENT STATE</span><span id="liveIcon" class="material-symbols-rounded">power_settings_new</span></div>
+          <div id="liveState" class="card-value">OFF</div>
+          <div id="liveAppliance" class="card-sub">Detected: None</div>
+        </div>
+        <div id="cardCurrentWrap" class="card">
+          <div class="card-head"><span>LIVE CURRENT (RMS)</span><span class="material-symbols-rounded">electric_meter</span></div>
+          <div id="liveCurrent" class="card-value">0.000 A</div>
+          <div id="liveSignal" class="card-sub">ADC Signal: 0.00 mV</div>
+        </div>
+        <div id="cardPowerWrap" class="card">
+          <div class="card-head"><span>ACTIVE POWER</span><span class="material-symbols-rounded">speed</span></div>
+          <div id="livePower" class="card-value">0.0 W</div>
+          <div id="liveCost" class="card-sub">Est. Cost: ₹0.00 / hr</div>
+        </div>
+        <div id="cardTimerWrap" class="card">
+          <div class="card-head"><span>ACTIVE SESSION TIMER</span><span class="material-symbols-rounded">timer</span></div>
+          <div id="liveTimer" class="card-value">00:00</div>
+          <div id="liveSince" class="card-sub">Idle</div>
+        </div>
+      </section>
 
-    <div class="toolbar">
-      <div class="chips">
-        <button class="chip active" onclick="setFilter('ALL', this)">All Events</button>
-        <button class="chip" onclick="setFilter('Iron', this)">Iron Only</button>
-        <button class="chip" onclick="setFilter('Fan', this)">Fan Only</button>
-        <button class="chip" onclick="setFilter('ON', this)">ON Logs</button>
-        <button class="chip" onclick="setFilter('OFF', this)">OFF Logs</button>
+      <div class="toolbar">
+        <div id="filterChipsWrap" class="chips"></div>
+        <button id="clearBtnWrap" class="btn-danger" onclick="clearLogs()">
+          <span class="material-symbols-rounded" style="font-size:18px;">delete</span> Clear History
+        </button>
       </div>
-      <button class="btn-danger" onclick="clearLogs()">
-        <span class="material-symbols-rounded" style="font-size:18px;">delete</span> Clear History
-      </button>
+
+      <div class="table-card">
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>State</th>
+                <th>Appliance</th>
+                <th>Sensor Reading</th>
+                <th>Date & Day</th>
+                <th>Exact Time (IST)</th>
+                <th>ON Duration / Status</th>
+              </tr>
+            </thead>
+            <tbody id="logBody">
+              <tr><td colspan="6" class="empty-state">Waiting for telemetry...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
     </div>
 
-    <div class="table-card">
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>State</th>
-              <th>Appliance</th>
-              <th>Sensor Reading</th>
-              <th>Date & Day</th>
-              <th>Exact Time (IST)</th>
-              <th>ON Duration / Status</th>
-            </tr>
-          </thead>
-          <tbody id="logBody">
-            <tr><td colspan="6" class="empty-state">Waiting for real-time telemetry...</td></tr>
-          </tbody>
-        </table>
+    <!-- PROTECTED ADMIN STUDIO VIEW -->
+    <div id="adminSection">
+      <div class="admin-grid">
+        <!-- Left Column: Appliance Manager -->
+        <div class="card">
+          <div class="panel-title">
+            <span>🔌 Dynamic Appliance Profiles & Logging Rules</span>
+            <button class="icon-btn" onclick="resetApplianceForm()">+ New Profile</button>
+          </div>
+
+          <!-- Live Sensor Helper Banner -->
+          <div style="padding:12px 14px;border-radius:12px;background:var(--primary-soft);border:1px solid rgba(99,102,241,0.3);margin-bottom:14px;font-size:0.84rem;">
+            📡 <strong>Live Uncalibrated Sensor Reading:</strong>
+            <span id="adminLiveRaw" class="mono" style="color:#34d399;font-size:1rem;">0.000 A</span>
+            (<span id="adminLiveMv" class="mono">0.00 mV</span>)
+            <div style="color:var(--text-muted);font-size:0.76rem;margin-top:3px;">
+              Tip: Turn ON any new appliance (Fridge, Charger, Cooler) and see its live Amps above to set its Min/Max range below!
+            </div>
+          </div>
+
+          <form id="appForm" onsubmit="saveAppliance(event)" style="background:rgba(11,15,25,0.6);padding:14px;border-radius:14px;border:1px solid var(--border);margin-bottom:16px;">
+            <input type="hidden" id="appId" value="">
+            <div class="form-grid">
+              <div class="field">
+                <label>Appliance Name</label>
+                <input type="text" id="appName" placeholder="e.g. Fridge / Mobile Charger" required>
+              </div>
+              <div class="field">
+                <label>Material Icon</label>
+                <select id="appIcon">
+                  <option value="iron">Iron (iron)</option>
+                  <option value="mode_fan">Fan (mode_fan)</option>
+                  <option value="kitchen">Fridge (kitchen)</option>
+                  <option value="ac_unit">Cooler / AC (ac_unit)</option>
+                  <option value="smartphone">Mobile Charger (smartphone)</option>
+                  <option value="laptop_mac">Laptop Charger (laptop_mac)</option>
+                  <option value="water_heater">Geyser / Heater (water_heater)</option>
+                  <option value="tv">TV / Monitor (tv)</option>
+                  <option value="bolt">General Load (bolt)</option>
+                </select>
+              </div>
+              <div class="field">
+                <label>Min Current (Amps)</label>
+                <input type="number" step="0.001" id="appMin" placeholder="0.050" required>
+              </div>
+              <div class="field">
+                <label>Max Current (Amps)</label>
+                <input type="number" step="0.001" id="appMax" placeholder="0.180" required>
+              </div>
+              <div class="field">
+                <label>Calibration Multiplier (1.00 = Exact)</label>
+                <input type="number" step="0.01" id="appCal" value="1.00" required>
+              </div>
+              <div class="field">
+                <label>Record in History Logs?</label>
+                <select id="appLog">
+                  <option value="1">✅ Yes - Log ON & OFF Events</option>
+                  <option value="0">🚫 No - Show Live Only (Do Not Log)</option>
+                </select>
+              </div>
+            </div>
+            <button type="submit" class="btn-primary" style="width:100%;margin-top:12px;">
+              <span class="material-symbols-rounded" style="font-size:18px;">save</span>
+              <span id="appSubmitText">Save Appliance Profile</span>
+            </button>
+          </form>
+
+          <div id="applianceList"></div>
+        </div>
+
+        <!-- Right Column: Sensor Calibration + Dashboard UI Controls -->
+        <div style="display:flex;flex-direction:column;gap:18px;">
+          <div class="card">
+            <div class="panel-title"><span>🎛️ Global Sensor Calibration (Auto-Syncs to ESP32)</span></div>
+            <form onsubmit="saveGlobalSettings(event)">
+              <div class="form-grid">
+                <div class="field">
+                  <label>ACS712 Base Sensitivity (mV/A)</label>
+                  <input type="number" step="0.01" id="cfgSens" required>
+                </div>
+                <div class="field">
+                  <label>Zero-Load Noise Floor (mV)</label>
+                  <input type="number" step="0.05" id="cfgNoise" required>
+                </div>
+                <div class="field">
+                  <label>Zero Deadzone (Amps)</label>
+                  <input type="number" step="0.005" id="cfgDeadzone" required>
+                </div>
+                <div class="field">
+                  <label>Turn-ON Threshold (Amps)</label>
+                  <input type="number" step="0.005" id="cfgOnA" required>
+                </div>
+                <div class="field">
+                  <label>Turn-OFF Threshold (Amps)</label>
+                  <input type="number" step="0.005" id="cfgOffA" required>
+                </div>
+                <div class="field">
+                  <label>Nominal AC Voltage (V)</label>
+                  <input type="number" step="1" id="cfgVolt" required>
+                </div>
+                <div class="field">
+                  <label>Electricity Tariff (₹ / kWh)</label>
+                  <input type="number" step="0.1" id="cfgTariff" required>
+                </div>
+                <div class="field">
+                  <label>Log Unmatched Loads?</label>
+                  <select id="cfgUnmatched">
+                    <option value="1">Yes (Log as Unknown Load)</option>
+                    <option value="0">No (Ignore Unmatched Loads)</option>
+                  </select>
+                </div>
+              </div>
+
+              <div class="panel-title" style="margin-top:20px;"><span>👁️ Dashboard Visibility & Branding</span></div>
+              <div class="form-grid" style="margin-bottom:12px;">
+                <div class="field">
+                  <label>Dashboard Heading</label>
+                  <input type="text" id="cfgTitle" required>
+                </div>
+                <div class="field">
+                  <label>Dashboard Subtitle</label>
+                  <input type="text" id="cfgSub" required>
+                </div>
+              </div>
+
+              <div class="toggle-row"><span>Show Current State Card</span><input type="checkbox" id="visState"></div>
+              <div class="toggle-row"><span>Show Live Current (Amps) Card</span><input type="checkbox" id="visCurrent"></div>
+              <div class="toggle-row"><span>Show Active Power (Watts) Card</span><input type="checkbox" id="visPower"></div>
+              <div class="toggle-row"><span>Show Active Session Timer Card</span><input type="checkbox" id="visTimer"></div>
+              <div class="toggle-row"><span>Show ADC Signal (mV) Subtext</span><input type="checkbox" id="visSignal"></div>
+              <div class="toggle-row"><span>Show Estimated Cost (₹/hr) Subtext</span><input type="checkbox" id="visCost"></div>
+              <div class="toggle-row"><span>Show Category Filter Chips</span><input type="checkbox" id="visFilters"></div>
+              <div class="toggle-row"><span>Allow Public Clear History (Without Login)</span><input type="checkbox" id="visClear"></div>
+
+              <div class="panel-title" style="margin-top:20px;"><span>🔐 Admin Credentials</span></div>
+              <div class="form-grid">
+                <div class="field">
+                  <label>Admin Username</label>
+                  <input type="text" id="cfgAdminUser" required>
+                </div>
+                <div class="field">
+                  <label>New Password (leave blank to keep)</label>
+                  <input type="password" id="cfgAdminPass" placeholder="••••••••">
+                </div>
+              </div>
+
+              <button type="submit" class="btn-primary" style="width:100%;margin-top:14px;">
+                💾 Save All Calibration & UI Settings
+              </button>
+            </form>
+          </div>
+        </div>
       </div>
     </div>
   </div>
 
+  <!-- Admin Login Modal -->
+  <div id="loginModal" class="modal-backdrop">
+    <div class="modal">
+      <div class="panel-title">
+        <span>🔐 Admin Studio Login</span>
+        <button class="icon-btn" onclick="closeLoginModal()">✕</button>
+      </div>
+      <p style="font-size:0.83rem;color:var(--text-muted);margin-bottom:14px;">
+        Enter your administrator credentials to configure appliances, calibration, and dashboard layout.
+      </p>
+      <form onsubmit="submitLogin(event)">
+        <div class="field" style="margin-bottom:12px;">
+          <label>Username</label>
+          <input type="text" id="loginUser" value="admin" required>
+        </div>
+        <div class="field" style="margin-bottom:16px;">
+          <label>Password</label>
+          <input type="password" id="loginPass" placeholder="Enter password" required>
+        </div>
+        <button type="submit" class="btn-primary" style="width:100%;">Unlock Admin Studio</button>
+      </form>
+    </div>
+  </div>
+
+  <div id="toast" class="toast">Saved!</div>
+
   <script>
     let allLogs = [];
-    let currentFilter = 'ALL';
+    let appliances = [];
+    let settings = {};
     let liveData = null;
-    let ws = null;
+    let currentFilter = 'ALL';
+    let isAdminView = false;
+    let adminCreds = {
+      user: sessionStorage.getItem('adm_u') || '',
+      pass: sessionStorage.getItem('adm_p') || ''
+    };
+
+    function showToast(msg) {
+      const t = document.getElementById('toast');
+      t.textContent = msg;
+      t.style.display = 'block';
+      setTimeout(() => t.style.display = 'none', 3000);
+    }
 
     function formatClock(sec) {
       if (sec < 0) sec = 0;
@@ -534,10 +996,36 @@ const HTML_UI = `<!DOCTYPE html>
       return h > 0 ? \`\${pad(h)}:\${pad(m)}:\${pad(s)}\` : \`\${pad(m)}:\${pad(s)}\`;
     }
 
-    function setFilter(f, btn) {
+    function applySettingsUI() {
+      if (!settings) return;
+      document.getElementById('uiTitle').textContent = settings.dashboard_title || 'ESP32 Smart Appliance Telemetry';
+      document.getElementById('uiSubtitle').textContent = settings.dashboard_subtitle || '';
+
+      document.getElementById('cardStateWrap').style.display = settings.show_state_card === '0' ? 'none' : 'block';
+      document.getElementById('cardCurrentWrap').style.display = settings.show_current_card === '0' ? 'none' : 'block';
+      document.getElementById('cardPowerWrap').style.display = settings.show_power_card === '0' ? 'none' : 'block';
+      document.getElementById('cardTimerWrap').style.display = settings.show_timer_card === '0' ? 'none' : 'block';
+      document.getElementById('liveSignal').style.display = settings.show_signal_mv === '0' ? 'none' : 'block';
+      document.getElementById('liveCost').style.display = settings.show_cost_est === '0' ? 'none' : 'block';
+      document.getElementById('filterChipsWrap').style.display = settings.show_filters === '0' ? 'none' : 'flex';
+      document.getElementById('clearBtnWrap').style.display = (settings.allow_public_clear === '1' || adminCreds.pass) ? 'inline-flex' : 'none';
+
+      // Render Dynamic Filter Chips based on configured Appliances
+      const chipContainer = document.getElementById('filterChipsWrap');
+      const baseChips = [
+        { key: 'ALL', label: 'All Events' },
+        ...appliances.map(a => ({ key: a.name, label: a.name })),
+        { key: 'ON', label: 'ON Logs' },
+        { key: 'OFF', label: 'OFF Logs' }
+      ];
+      chipContainer.innerHTML = baseChips.map(c => \`
+        <button class="chip \${currentFilter === c.key ? 'active' : ''}" onclick="setFilter('\${c.key.replace(/'/g, "\\\\'")}')">\${c.label}</button>
+      \`).join('');
+    }
+
+    function setFilter(f) {
       currentFilter = f;
-      document.querySelectorAll('.chip').forEach(c => c.classList.remove('active'));
-      btn.classList.add('active');
+      applySettingsUI();
       renderLogs();
     }
 
@@ -547,13 +1035,25 @@ const HTML_UI = `<!DOCTYPE html>
       const isOn = live.state === 'ON';
       const espOnline = live.esp_online === 1 && (Date.now() - live.updated_ms < 12000);
 
-      document.getElementById('stateCard').className = 'card ' + (isOn ? 'state-on' : '');
+      document.getElementById('cardStateWrap').className = 'card ' + (isOn ? 'state-on' : '');
       document.getElementById('liveState').textContent = live.state;
       document.getElementById('liveState').style.color = isOn ? '#34d399' : '#f8fafc';
+      document.getElementById('liveIcon').textContent = live.icon || 'power_settings_new';
       document.getElementById('liveAppliance').textContent = 'Detected: ' + (live.appliance || 'None');
       document.getElementById('liveCurrent').textContent = Number(live.current_a).toFixed(3) + ' A';
       document.getElementById('liveSignal').textContent = 'ADC Signal: ' + Number(live.signal_mv).toFixed(2) + ' mV';
       document.getElementById('livePower').textContent = Number(live.power_w).toFixed(1) + ' W';
+
+      const rate = Number(settings.tariff_rate || 8.5);
+      const costPerHr = (Number(live.power_w) / 1000) * rate;
+      document.getElementById('liveCost').textContent = \`Est. Cost: ₹\${costPerHr.toFixed(2)} / hr (@ ₹\${rate}/kWh)\`;
+
+      // Update Admin Live Raw Helper
+      const rawEl = document.getElementById('adminLiveRaw');
+      if (rawEl) {
+        rawEl.textContent = Number(live.raw_current_a ?? live.current_a).toFixed(3) + ' A';
+        document.getElementById('adminLiveMv').textContent = Number(live.signal_mv).toFixed(2) + ' mV';
+      }
 
       const dot = document.getElementById('connDot');
       const txt = document.getElementById('connText');
@@ -561,14 +1061,14 @@ const HTML_UI = `<!DOCTYPE html>
 
       if (espOnline) {
         dot.className = 'dot online';
-        txt.textContent = 'ESP32 Online (Real-Time)';
+        txt.textContent = 'ESP32 Live';
         banner.style.display = 'none';
         document.getElementById('liveSince').textContent = isOn ? 'Streaming Live (1s rate)' : 'Load is OFF';
       } else {
         dot.className = 'dot';
-        txt.textContent = 'ESP32 Offline / Power Lost';
+        txt.textContent = 'ESP32 Offline';
         banner.style.display = 'flex';
-        document.getElementById('liveSince').textContent = isOn ? '⚠️ Last known state: ON (ESP Offline)' : 'ESP32 Offline';
+        document.getElementById('liveSince').textContent = isOn ? '⚠️ Last state: ON (ESP Offline)' : 'ESP32 Offline';
       }
     }
 
@@ -577,17 +1077,17 @@ const HTML_UI = `<!DOCTYPE html>
       const filtered = allLogs.filter(item => {
         if (currentFilter === 'ALL') return true;
         if (currentFilter === 'ON' || currentFilter === 'OFF') return item.event_type === currentFilter;
-        return item.appliance.includes(currentFilter);
+        return item.appliance === currentFilter || item.appliance.includes(currentFilter);
       });
 
       if (!filtered.length) {
-        tbody.innerHTML = '<tr><td colspan="6" class="empty-state">No ON/OFF events recorded yet.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="6" class="empty-state">No matching ON/OFF events recorded yet.</td></tr>';
         return;
       }
 
       tbody.innerHTML = filtered.map(row => {
         const isOn = row.event_type === 'ON';
-        const icon = row.appliance.includes('Iron') ? 'iron' : (row.appliance.includes('Fan') ? 'mode_fan' : 'power');
+        const icon = row.icon || (row.appliance.includes('Iron') ? 'iron' : (row.appliance.includes('Fan') ? 'mode_fan' : 'bolt'));
         return \`
           <tr>
             <td data-label="State">
@@ -620,25 +1120,238 @@ const HTML_UI = `<!DOCTYPE html>
       }).join('');
     }
 
+    // ADMIN STUDIO FUNCTIONS
+    function toggleAdminView() {
+      if (isAdminView) {
+        isAdminView = false;
+        document.getElementById('adminSection').style.display = 'none';
+        document.getElementById('dashboardSection').style.display = 'block';
+        document.getElementById('adminBtn').classList.remove('active');
+        document.getElementById('adminBtnText').textContent = 'Admin Studio';
+        return;
+      }
+      if (!adminCreds.pass) {
+        document.getElementById('loginModal').style.display = 'grid';
+      } else {
+        openAdminPanel();
+      }
+    }
+
+    function closeLoginModal() {
+      document.getElementById('loginModal').style.display = 'none';
+    }
+
+    async function submitLogin(e) {
+      e.preventDefault();
+      const username = document.getElementById('loginUser').value.trim();
+      const password = document.getElementById('loginPass').value;
+      const res = await fetch('/api/admin/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password })
+      });
+      const data = await res.json();
+      if (res.ok && data.ok) {
+        adminCreds = { user: username, pass: password };
+        sessionStorage.setItem('adm_u', username);
+        sessionStorage.setItem('adm_p', password);
+        closeLoginModal();
+        openAdminPanel();
+        showToast('Welcome to Admin Studio!');
+      } else {
+        alert(data.error || 'Invalid credentials!');
+      }
+    }
+
+    function openAdminPanel() {
+      isAdminView = true;
+      document.getElementById('dashboardSection').style.display = 'none';
+      document.getElementById('adminSection').style.display = 'block';
+      document.getElementById('adminBtn').classList.add('active');
+      document.getElementById('adminBtnText').textContent = '← Back to Live Dashboard';
+      populateAdminForms();
+    }
+
+    function populateAdminForms() {
+      // Populate Appliance List
+      const box = document.getElementById('applianceList');
+      box.innerHTML = appliances.map(a => \`
+        <div class="app-item">
+          <div>
+            <div style="display:flex;align-items:center;gap:8px;font-weight:700;">
+              <span class="material-symbols-rounded" style="color:#818cf8;">\${a.icon}</span>
+              <span>\${a.name}</span>
+              <span class="badge \${a.log_enabled ? 'badge-on' : 'badge-off'}" style="font-size:0.68rem;padding:2px 8px;">
+                \${a.log_enabled ? 'LOGGING ON' : 'LIVE ONLY (NO LOG)'}
+              </span>
+            </div>
+            <div class="app-meta">
+              Range: \${Number(a.min_a).toFixed(3)}A – \${Number(a.max_a).toFixed(3)}A | Cal Factor: ×\${Number(a.cal_factor).toFixed(2)}
+            </div>
+          </div>
+          <div style="display:flex;gap:6px;">
+            <button class="icon-btn" onclick='editAppliance(\${JSON.stringify(a)})'>Edit</button>
+            <button class="icon-btn" style="color:#fda4af;" onclick="deleteAppliance(\${a.id})">Delete</button>
+          </div>
+        </div>
+      \`).join('');
+
+      // Populate Global Calibration & Visibility Settings
+      document.getElementById('cfgSens').value = settings.base_sensitivity || '63.00';
+      document.getElementById('cfgNoise').value = settings.noise_floor_mv || '5.20';
+      document.getElementById('cfgDeadzone').value = settings.deadzone_amps || '0.05';
+      document.getElementById('cfgOnA').value = settings.on_threshold_amps || '0.06';
+      document.getElementById('cfgOffA').value = settings.off_threshold_amps || '0.04';
+      document.getElementById('cfgVolt').value = settings.ac_voltage || '230';
+      document.getElementById('cfgTariff').value = settings.tariff_rate || '8.5';
+      document.getElementById('cfgUnmatched').value = settings.log_unmatched ?? '1';
+      document.getElementById('cfgTitle').value = settings.dashboard_title || '';
+      document.getElementById('cfgSub').value = settings.dashboard_subtitle || '';
+      document.getElementById('cfgAdminUser').value = settings.admin_user || 'admin';
+
+      document.getElementById('visState').checked = settings.show_state_card !== '0';
+      document.getElementById('visCurrent').checked = settings.show_current_card !== '0';
+      document.getElementById('visPower').checked = settings.show_power_card !== '0';
+      document.getElementById('visTimer').checked = settings.show_timer_card !== '0';
+      document.getElementById('visSignal').checked = settings.show_signal_mv !== '0';
+      document.getElementById('visCost').checked = settings.show_cost_est !== '0';
+      document.getElementById('visFilters').checked = settings.show_filters !== '0';
+      document.getElementById('visClear').checked = settings.allow_public_clear === '1';
+    }
+
+    function editAppliance(a) {
+      document.getElementById('appId').value = a.id;
+      document.getElementById('appName').value = a.name;
+      document.getElementById('appIcon').value = a.icon || 'bolt';
+      document.getElementById('appMin').value = a.min_a;
+      document.getElementById('appMax').value = a.max_a;
+      document.getElementById('appCal').value = a.cal_factor || 1.0;
+      document.getElementById('appLog').value = a.log_enabled ? '1' : '0';
+      document.getElementById('appSubmitText').textContent = 'Update Appliance Profile #' + a.id;
+    }
+
+    function resetApplianceForm() {
+      document.getElementById('appId').value = '';
+      document.getElementById('appName').value = '';
+      document.getElementById('appMin').value = '';
+      document.getElementById('appMax').value = '';
+      document.getElementById('appCal').value = '1.00';
+      document.getElementById('appLog').value = '1';
+      document.getElementById('appSubmitText').textContent = 'Save New Appliance Profile';
+    }
+
+    async function saveAppliance(e) {
+      e.preventDefault();
+      const payload = {
+        id: document.getElementById('appId').value || null,
+        name: document.getElementById('appName').value.trim(),
+        icon: document.getElementById('appIcon').value,
+        min_a: Number(document.getElementById('appMin').value),
+        max_a: Number(document.getElementById('appMax').value),
+        cal_factor: Number(document.getElementById('appCal').value),
+        log_enabled: document.getElementById('appLog').value === '1',
+        active: true
+      };
+      const res = await fetch('/api/admin/appliance', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Admin-User': adminCreds.user,
+          'X-Admin-Pass': adminCreds.pass
+        },
+        body: JSON.stringify(payload)
+      });
+      if (res.ok) {
+        resetApplianceForm();
+        showToast('Appliance profile saved!');
+      } else {
+        alert('Session expired, please login again.');
+        adminCreds.pass = '';
+      }
+    }
+
+    async function deleteAppliance(id) {
+      if (!confirm('Delete this appliance profile?')) return;
+      await fetch('/api/admin/appliance?id=' + id, {
+        method: 'DELETE',
+        headers: { 'X-Admin-User': adminCreds.user, 'X-Admin-Pass': adminCreds.pass }
+      });
+      showToast('Appliance deleted');
+    }
+
+    async function saveGlobalSettings(e) {
+      e.preventDefault();
+      const newPass = document.getElementById('cfgAdminPass').value;
+      const newUser = document.getElementById('cfgAdminUser').value.trim();
+      const payload = {
+        base_sensitivity: document.getElementById('cfgSens').value,
+        noise_floor_mv: document.getElementById('cfgNoise').value,
+        deadzone_amps: document.getElementById('cfgDeadzone').value,
+        on_threshold_amps: document.getElementById('cfgOnA').value,
+        off_threshold_amps: document.getElementById('cfgOffA').value,
+        ac_voltage: document.getElementById('cfgVolt').value,
+        tariff_rate: document.getElementById('cfgTariff').value,
+        log_unmatched: document.getElementById('cfgUnmatched').value,
+        dashboard_title: document.getElementById('cfgTitle').value.trim(),
+        dashboard_subtitle: document.getElementById('cfgSub').value.trim(),
+        show_state_card: document.getElementById('visState').checked ? '1' : '0',
+        show_current_card: document.getElementById('visCurrent').checked ? '1' : '0',
+        show_power_card: document.getElementById('visPower').checked ? '1' : '0',
+        show_timer_card: document.getElementById('visTimer').checked ? '1' : '0',
+        show_signal_mv: document.getElementById('visSignal').checked ? '1' : '0',
+        show_cost_est: document.getElementById('visCost').checked ? '1' : '0',
+        show_filters: document.getElementById('visFilters').checked ? '1' : '0',
+        allow_public_clear: document.getElementById('visClear').checked ? '1' : '0',
+        admin_user: newUser,
+        admin_pass: newPass
+      };
+
+      const res = await fetch('/api/admin/settings', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Admin-User': adminCreds.user,
+          'X-Admin-Pass': adminCreds.pass
+        },
+        body: JSON.stringify(payload)
+      });
+      if (res.ok) {
+        adminCreds.user = newUser;
+        sessionStorage.setItem('adm_u', newUser);
+        if (newPass) {
+          adminCreds.pass = newPass;
+          sessionStorage.setItem('adm_p', newPass);
+          document.getElementById('cfgAdminPass').value = '';
+        }
+        showToast('Settings saved & synced to ESP32!');
+      }
+    }
+
     function connectWS() {
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-      ws = new WebSocket(\`\${proto}//\${location.host}/api/ws\`);
+      const ws = new WebSocket(\`\${proto}//\${location.host}/api/ws\`);
       ws.onmessage = (e) => {
         if (e.data === 'PONG') return;
         const data = JSON.parse(e.data);
         if (data.type === 'SYNC') {
           allLogs = data.logs || [];
+          appliances = data.appliances || [];
+          settings = data.settings || {};
+          applySettingsUI();
           updateLiveUI(data.live);
           renderLogs();
+          if (isAdminView) populateAdminForms();
         } else if (data.type === 'LIVE') {
           updateLiveUI(data.live);
         }
       };
       ws.onclose = () => setTimeout(connectWS, 1500);
+      setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) ws.send('PING');
+      }, 10000);
     }
 
     setInterval(() => {
-      if (ws && ws.readyState === WebSocket.OPEN) ws.send('PING');
       if (liveData) {
         updateLiveUI(liveData);
         if (liveData.state === 'ON') {
@@ -652,7 +1365,11 @@ const HTML_UI = `<!DOCTYPE html>
 
     async function clearLogs() {
       if (!confirm('Clear all appliance history logs?')) return;
-      await fetch('/api/clear', { method: 'DELETE' });
+      const res = await fetch('/api/clear', {
+        method: 'DELETE',
+        headers: { 'X-Admin-User': adminCreds.user, 'X-Admin-Pass': adminCreds.pass }
+      });
+      if (!res.ok) alert('Please unlock Admin Studio first to clear history!');
     }
 
     connectWS();
